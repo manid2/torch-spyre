@@ -18,12 +18,13 @@ from typing import Any, Union
 import os
 import subprocess
 
+import sympy
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
 from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from torch_spyre._inductor.logging_utils import get_inductor_logger
-from . import OpSpec, ConstantArg, UnimplementedOp
+from . import OpSpec, ConstantArg, TensorArg, UnimplementedOp
 from .kernel_runner import (
     SpyreSDSCKernelRunner,
     SpyreUnimplementedRunner,
@@ -89,11 +90,44 @@ class SpyreAsyncCompile:
                         }
                     )
                     arg_map.append(ts.arg_index)
+            # Resolve symbolic dimensions to concrete integers
+            # For dynamic shapes, we need to evaluate sympy expressions
+            dimensions = []
+            for dim in ks.iteration_space:
+                if isinstance(dim, int):
+                    dimensions.append(dim)
+                elif isinstance(dim, sympy.Expr):
+                    # Try to evaluate symbolic expression
+                    # Extract the actual size from tensor arguments
+                    resolved = False
+                    for arg in ks.args:
+                        if isinstance(arg, TensorArg):
+                            for size in arg.host_size:
+                                if size == dim:
+                                    dimensions.append(int(size))
+                                    resolved = True
+                                    break
+                        if resolved:
+                            break
+                    if not resolved:
+                        # If we can't resolve it, try to convert directly
+                        try:
+                            dimensions.append(int(dim))
+                        except (TypeError, ValueError):
+                            # Keep as-is and let it fail later with better error
+                            dimensions.append(dim)
+                else:
+                    # Try to convert to int
+                    try:
+                        dimensions.append(int(dim))
+                    except (TypeError, ValueError):
+                        dimensions.append(dim)
+            
             kernel_descriptor = {
                 "name": kernel_name,
                 "reduction": ks.is_reduction,
                 "op": ks.op,
-                "dimensions": ks.iteration_space,
+                "dimensions": dimensions,
                 "inputs": inputs,
                 "outputs": outputs,
             }

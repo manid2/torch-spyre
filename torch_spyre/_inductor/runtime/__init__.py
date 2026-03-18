@@ -68,14 +68,14 @@ class OpSpec:
     Attributes:
         op: The name of the operation.
         is_reduction: Is the operation a reduction?
-        iteration_space: The iteration space of the operation.
+        iteration_space: The iteration space of the operation. Can contain symbolic expressions for dynamic shapes.
         args: The input and output arguments to the operation.
         op_info: A dictionary of auxiliary information whose content is operation-specific.
     """
 
     op: str
     is_reduction: bool
-    iteration_space: list[int]
+    iteration_space: list[Union[int, Any]]  # Can contain int or sympy.Expr for dynamic shapes
     args: Sequence[TensorArg | ConstantArg]
     op_info: dict[str, Any]
 

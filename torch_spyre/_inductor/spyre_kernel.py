@@ -111,7 +111,7 @@ class UnimplementedOp(RValue):
 @dataclass(frozen=True)
 class DimensionInfo:
     var: sympy.Symbol
-    numel: int
+    numel: Union[int, sympy.Expr]
 
 
 class SpyreOpFuncs:
@@ -372,7 +372,23 @@ def create_op_spec(
             torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
-    return OpSpec(op, is_reduction, [d.numel for d in dims], args, op_info)
+    
+    # Convert symbolic dimensions to integers
+    # For dynamic shapes, we need to keep them as sympy expressions
+    iteration_space = []
+    for d in dims:
+        if isinstance(d.numel, sympy.Expr):
+            # Try to evaluate the expression if possible
+            try:
+                val = int(d.numel)
+                iteration_space.append(val)
+            except (TypeError, ValueError):
+                # Keep as symbolic expression - will be resolved at runtime
+                iteration_space.append(d.numel)
+        else:
+            iteration_space.append(d.numel)
+    
+    return OpSpec(op, is_reduction, iteration_space, args, op_info)
 
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
@@ -696,7 +712,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
             return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+                DimensionInfo(dim_map[v], var_ranges.get(dim_map[v], 1))
                 for v in sorted(dim_map)
             ]
         else:
