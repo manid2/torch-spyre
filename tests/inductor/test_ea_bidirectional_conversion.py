@@ -15,11 +15,24 @@
 """
 Test bidirectional FP16↔FP32 type conversion with ElementArrangement.
 
+Compiled-path tests
 Tests all 4 conversion cases:
 1. FP16→FP32 with STANDARD → DL16_TO_FP32
 2. FP16→FP32 with FP32_TO_DL16 → STANDARD
 3. FP32→FP16 with STANDARD → FP32_TO_DL16
 4. FP32→FP16 with DL16_TO_FP32 → STANDARD
+
+Eager-path tests:
+1. FP16→FP32 with STANDARD → DL16_TO_FP32
+2. BF16→FP32 with STANDARD → DL16_TO_FP32
+3. FP16→FP32 with DL16_TO_FP32 → STANDARD
+4. BF16→FP32 with DL16_TO_FP32 → STANDARD
+
+FP32 to FP16 eager mode type conversion is not yet supported so verify only EA
+1. FP32→FP16 with STANDARD → FP32_TO_DL16
+2. FP32→BF16 with STANDARD → FP32_TO_DL16
+3. FP32→FP16 with FP32_TO_DL16 → STANDARD
+4. BF32→FP16 with FP32_TO_DL16 → STANDARD
 """
 
 import pytest
@@ -234,6 +247,84 @@ def test_stagger_to_standard_ea(x):
     spyre_result = compiled_fn(x.to("spyre"))
     ea = get_spyre_tensor_layout(spyre_result).element_arrangement
     assert ea == ElementArrangement.STANDARD, f"Expected STANDARD EA, got {ea}"
+
+
+# ---------------------------------------------------------------------------
+# Eager-path unit tests
+# ---------------------------------------------------------------------------
+def get_ea(tensor):
+    layout = get_spyre_tensor_layout(tensor)
+    return layout.element_arrangement if layout else None
+
+
+def assert_ea(tensor, expected_ea):
+    actual_ea = get_ea(tensor)
+    assert actual_ea == expected_ea, f"Expected EA: {expected_ea}, Got EA: {actual_ea}"
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("dtype_16", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "eager_to",
+    [
+        lambda x, d, dt: x.to(device=d, dtype=dt),
+        lambda x, d, dt: x.to(d, dtype=dt),
+        lambda x, d, dt: x.to(d, dt),
+        lambda x, d, dt: x.to(torch.device(d), dt),
+    ],
+)
+def test_eager_ea(device, dtype_16, eager_to):
+    """Verify eager mode EA."""
+    # FP16 eager EA STANDARD
+    x_16 = torch.randn(4, 128, device=device, dtype=dtype_16)
+    assert_ea(x_16, ElementArrangement.STANDARD)
+
+    # FP16 with EA STANDARD -> FP32 creates EA DL16_TO_FP32
+    res_32 = eager_to(x_16, device, torch.float32)
+    assert_ea(res_32, ElementArrangement.DL16_TO_FP32)
+
+    # FP32 with EA DL16_TO_FP32 -> FP16 restores EA STANDARD
+    res_16_restored = eager_to(res_32, device, dtype_16)
+    assert_ea(res_16_restored, ElementArrangement.STANDARD)
+
+    # FP32 eager EA STANDARD
+    x_32 = torch.randn(4, 128, device=device, dtype=torch.float32)
+    assert_ea(x_32, ElementArrangement.STANDARD)
+
+    # FP32 with EA STANDARD -> FP16 creates EA FP32_TO_DL16
+    res_16 = eager_to(x_32, device, dtype_16)
+    assert_ea(res_16, ElementArrangement.FP32_TO_DL16)
+
+    # FP16 with EA FP32_TO_DL16 -> FP32 restores EA STANDARD
+    res_32_restored = eager_to(res_16, device, torch.float32)
+    assert_ea(res_32_restored, ElementArrangement.STANDARD)
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("src_dtype", [torch.float16, torch.bfloat16])
+def test_eager_fp16_to_fp32(device, src_dtype):
+    """Test FP16→FP32 with STANDARD input creates DL16_TO_FP32."""
+    x = torch.randn(4, 128, device=device, dtype=src_dtype)
+    x_fp32 = x.to(torch.float32)
+    assert_ea(x_fp32, ElementArrangement.DL16_TO_FP32)
+
+    # FP32 with EA DL16_TO_FP32 -> FP16 should restore to STANDARD
+    result = x_fp32.to(src_dtype)
+    assert_ea(result, ElementArrangement.STANDARD)
+
+
+@pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("dst_dtype", [torch.float16, torch.bfloat16])
+def test_eager_fp32_to_fp16(device, dst_dtype):
+    """Test FP32→FP16 with FP32_TO_DL16 input restores to STANDARD."""
+    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x_fp16 = x.to(dst_dtype)
+    assert_ea(x_fp16, ElementArrangement.FP32_TO_DL16)
+
+    # FP16 with EA FP32_TO_DL16 -> FP32 should restore to STANDARD
+    result = x_fp16.to(torch.float32)
+    assert_ea(result, ElementArrangement.STANDARD)
 
 
 # Made with Bob

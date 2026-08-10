@@ -23,6 +23,101 @@ if TYPE_CHECKING:
     from torch_spyre._C import SpyreTensorLayout
 
 
+def _add_ea(src_tensor, res_tensor) -> None:
+    """Update ElementArrangement (EA) tag on output SpyreTensorLayout
+
+    For to_dtype op in eager mode.
+    """
+    if res_tensor.dtype == src_tensor.dtype:
+        return
+
+    import torch
+
+    # Skip FakeTensor tracing contexts during torch.compile
+    if (
+        torch.compiler.is_compiling()
+        or isinstance(src_tensor, torch._subclasses.FakeTensor)
+        or isinstance(res_tensor, torch._subclasses.FakeTensor)
+    ):
+        return
+
+    from torch_spyre._C import (
+        ElementArrangement,
+        get_spyre_tensor_layout,
+        set_spyre_tensor_layout,
+    )
+
+    # Determine appropriate EA tag based on source EA and conversion direction.
+    # TODO EA torch.bool as it can be fp16 or fp32
+    # TODO Use common function to set EA as this is already done in
+    # torch_spyre/_inductor/propagate_layouts.py need to reuse it here.
+
+    try:
+        src_layout = get_spyre_tensor_layout(src_tensor)
+    except RuntimeError:
+        return
+
+    if src_layout is None:
+        return
+
+    EA_MAP = {
+        (
+            torch.float16,
+            torch.float32,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.DL16_TO_FP32,
+        (
+            torch.bfloat16,
+            torch.float32,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.DL16_TO_FP32,
+        (
+            torch.float16,
+            torch.float32,
+            ElementArrangement.FP32_TO_DL16,
+        ): ElementArrangement.STANDARD,
+        (
+            torch.bfloat16,
+            torch.float32,
+            ElementArrangement.FP32_TO_DL16,
+        ): ElementArrangement.STANDARD,
+        (
+            torch.float32,
+            torch.float16,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.FP32_TO_DL16,
+        (
+            torch.float32,
+            torch.bfloat16,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.FP32_TO_DL16,
+        (
+            torch.float32,
+            torch.float16,
+            ElementArrangement.DL16_TO_FP32,
+        ): ElementArrangement.STANDARD,
+        (
+            torch.float32,
+            torch.bfloat16,
+            ElementArrangement.DL16_TO_FP32,
+        ): ElementArrangement.STANDARD,
+    }
+
+    fmt = EA_MAP.get(
+        (src_tensor.dtype, res_tensor.dtype, src_layout.element_arrangement)
+    )
+
+    if fmt is not None:
+        try:
+            res_layout = get_spyre_tensor_layout(res_tensor)
+        except RuntimeError:
+            return
+
+        if res_layout is not None:
+            new_layout = res_layout.with_element_arrangement(fmt)
+            set_spyre_tensor_layout(res_tensor, new_layout)
+
+
 def _patch_tensor_for_spyre():
     import torch
 
@@ -82,14 +177,20 @@ def _patch_tensor_for_spyre():
             ):
                 _device = args[0]
             _dtype = kwargs.get("dtype", None)
-            if _dtype is None and len(args) > 1 and isinstance(args[1], torch.dtype):
-                _dtype = args[1]
+            if _dtype is None:
+                if len(args) > 0 and isinstance(args[0], torch.dtype):
+                    _dtype = args[0]
+                elif len(args) > 1 and isinstance(args[1], torch.dtype):
+                    _dtype = args[1]
+
+            target_device_type = (
+                torch.device(_device).type if _device is not None else None
+            )
 
             if (
-                _device is not None
+                target_device_type == DEVICE_NAME
                 and _dtype is not None
                 and self.device.type == DEVICE_NAME
-                and torch.device(_device).type == DEVICE_NAME
             ):
                 import warnings
 
@@ -101,8 +202,16 @@ def _patch_tensor_for_spyre():
                 # Step 1: plain D2H copy (no dtype change)
                 tmp = orig_to(self, "cpu")
                 # Step 2: cast dtype via H2D
-                return orig_to(tmp, _device, dtype=_dtype)
-            return orig_to(self, *args, **kwargs)
+                res = orig_to(tmp, _device, dtype=_dtype)
+            else:
+                # Perform type conversion in eager mode
+                res = orig_to(self, *args, **kwargs)
+
+            # Apply EA tag if converted on Spyre device
+            if self.device.type == DEVICE_NAME:
+                _add_ea(self, res)
+
+            return res
         else:
             # Check if copy kwarg is explicitly set
             copy = kwargs.get("copy")
