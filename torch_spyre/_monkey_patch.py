@@ -33,6 +33,8 @@ def _add_ea(src_tensor, res_tensor) -> None:
 
     import torch
     from torch_spyre._inductor.dtype_ops import DtypeOpTable
+    from torch_spyre._inductor.constants import STAGGERED_EAS
+    from torch_spyre._inductor.pass_utils import rescale_stl_for_dtype
 
     # Skip FakeTensor tracing contexts during torch.compile
     if (
@@ -57,18 +59,22 @@ def _add_ea(src_tensor, res_tensor) -> None:
     if src_layout is None:
         return
 
-    fmt = DtypeOpTable.ea_map(
-        src_tensor.dtype, res_tensor.dtype, src_layout.element_arrangement
-    )
+    input_ea = src_layout.element_arrangement
+    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
 
     try:
         res_layout = get_spyre_tensor_layout(res_tensor)
     except RuntimeError:
         return
 
-    if res_layout is not None:
-        new_layout = res_layout.with_element_arrangement(fmt)
-        set_spyre_tensor_layout(res_tensor, new_layout)
+    if res_layout is None:
+        return
+
+    stl = res_layout.with_element_arrangement(fmt)
+    if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+        stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
+
+    set_spyre_tensor_layout(res_tensor, stl)
 
 
 def _patch_tensor_for_spyre():
