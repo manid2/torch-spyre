@@ -175,6 +175,10 @@ class DtypeOpTable:
         return op in cls._TYPECAST_OP_NAMES
 
     @classmethod
+    def fp16_types(cls) -> list:
+        return cls._FP16_TYPES
+
+    @classmethod
     def ea_map(cls, src_dtype, dst_dtype, src_ea) -> ElementArrangement:
         fmt = cls._EA_MAP.get((src_dtype, dst_dtype, src_ea))
         if fmt is not None:

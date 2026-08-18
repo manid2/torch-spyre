@@ -45,6 +45,7 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     from torch_spyre._C import (
+        ElementArrangement,
         get_spyre_tensor_layout,
         set_spyre_tensor_layout,
     )
@@ -62,6 +63,13 @@ def _add_ea(src_tensor, res_tensor) -> None:
     input_ea = src_layout.element_arrangement
     fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
 
+    # FP32 -> FP16 runtime type conversion is not yet supported.
+    if (
+        src_tensor.dtype == torch.float32
+        and res_tensor.dtype in DtypeOpTable.fp16_types()
+    ):
+        fmt = ElementArrangement.STANDARD
+
     try:
         res_layout = get_spyre_tensor_layout(res_tensor)
     except RuntimeError:
@@ -71,7 +79,8 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     stl = res_layout.with_element_arrangement(fmt)
-    if fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS:
+    is_staggered_ea = fmt in STAGGERED_EAS or input_ea in STAGGERED_EAS
+    if src_tensor.dtype != torch.float32 and is_staggered_ea:
         stl = rescale_stl_for_dtype(src_layout, res_tensor.dtype, fmt)
 
     set_spyre_tensor_layout(res_tensor, stl)
@@ -161,13 +170,10 @@ def _patch_tensor_for_spyre():
                 # Step 1: plain D2H copy (no dtype change)
                 tmp = orig_to(self, "cpu")
                 # Step 2: cast dtype via H2D
-                res = orig_to(tmp, _device, dtype=_dtype)
-            else:
-                # Perform type conversion in eager mode
-                res = orig_to(self, *args, **kwargs)
+                return orig_to(tmp, _device, dtype=_dtype)
 
-            # Apply EA tag if converted on Spyre device
-            if self.device.type == DEVICE_NAME:
+            res = orig_to(self, *args, **kwargs)
+            if res.device.type == DEVICE_NAME:
                 _add_ea(self, res)
 
             return res

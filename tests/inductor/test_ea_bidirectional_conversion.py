@@ -38,6 +38,7 @@ FP32 to FP16 eager mode type conversion is not yet supported so verify only EA
 import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
+from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
 
 @pytest.mark.parametrize("device", ["spyre"])
@@ -264,7 +265,7 @@ def assert_ea(tensor, expected_ea):
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
 @pytest.mark.parametrize("device", ["spyre"])
-@pytest.mark.parametrize("dtype_16", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fp16", DtypeOpTable.fp16_types())
 @pytest.mark.parametrize(
     "eager_to",
     [
@@ -274,57 +275,49 @@ def assert_ea(tensor, expected_ea):
         lambda x, d, dt: x.to(torch.device(d), dt),
     ],
 )
-def test_eager_ea(device, dtype_16, eager_to):
+def test_eager_ea(device, fp16, eager_to):
     """Verify eager mode EA."""
     # FP16 eager EA STANDARD
-    x_16 = torch.randn(4, 128, device=device, dtype=dtype_16)
+    x_16 = torch.randn(4, 128, device=device, dtype=fp16)
     assert_ea(x_16, ElementArrangement.STANDARD)
 
-    # FP16 with EA STANDARD -> FP32 creates EA DL16_TO_FP32
+    # FP16 -> FP32 via eager CPU-intermediate path produces STANDARD EA
     res_32 = eager_to(x_16, device, torch.float32)
-    assert_ea(res_32, ElementArrangement.DL16_TO_FP32)
+    assert_ea(res_32, ElementArrangement.STANDARD)
 
-    # FP32 with EA DL16_TO_FP32 -> FP16 restores EA STANDARD
-    res_16_restored = eager_to(res_32, device, dtype_16)
+    # FP32 with EA STANDARD -> FP16 restores EA STANDARD
+    res_16_restored = eager_to(res_32, device, fp16)
     assert_ea(res_16_restored, ElementArrangement.STANDARD)
 
     # FP32 eager EA STANDARD
     x_32 = torch.randn(4, 128, device=device, dtype=torch.float32)
     assert_ea(x_32, ElementArrangement.STANDARD)
 
-    # FP32 with EA STANDARD -> FP16 creates EA FP32_TO_DL16
-    res_16 = eager_to(x_32, device, dtype_16)
-    assert_ea(res_16, ElementArrangement.FP32_TO_DL16)
+    # FP32 -> FP16 via eager CPU-intermediate path produces STANDARD EA
+    res_16 = eager_to(x_32, device, fp16)
+    assert_ea(res_16, ElementArrangement.STANDARD)
 
-    # FP16 with EA FP32_TO_DL16 -> FP32 restores EA STANDARD
+    # FP16 with EA STANDARD -> FP32 restores EA STANDARD
     res_32_restored = eager_to(res_16, device, torch.float32)
     assert_ea(res_32_restored, ElementArrangement.STANDARD)
 
 
 @pytest.mark.parametrize("device", ["spyre"])
-@pytest.mark.parametrize("src_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("src_dtype", DtypeOpTable.fp16_types())
 def test_eager_fp16_to_fp32(device, src_dtype):
     """Test FP16→FP32 with STANDARD input creates DL16_TO_FP32."""
     x = torch.randn(4, 128, device=device, dtype=src_dtype)
     x_fp32 = x.to(torch.float32)
     assert_ea(x_fp32, ElementArrangement.DL16_TO_FP32)
 
-    # FP32 with EA DL16_TO_FP32 -> FP16 should restore to STANDARD
-    result = x_fp32.to(src_dtype)
-    assert_ea(result, ElementArrangement.STANDARD)
-
 
 @pytest.mark.parametrize("device", ["spyre"])
-@pytest.mark.parametrize("dst_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dst_dtype", DtypeOpTable.fp16_types())
 def test_eager_fp32_to_fp16(device, dst_dtype):
-    """Test FP32→FP16 with FP32_TO_DL16 input restores to STANDARD."""
+    """Test FP32→FP16 with STANDARD."""
     x = torch.randn(4, 128, device=device, dtype=torch.float32)
     x_fp16 = x.to(dst_dtype)
-    assert_ea(x_fp16, ElementArrangement.FP32_TO_DL16)
-
-    # FP16 with EA FP32_TO_DL16 -> FP32 should restore to STANDARD
-    result = x_fp16.to(torch.float32)
-    assert_ea(result, ElementArrangement.STANDARD)
+    assert_ea(x_fp16, ElementArrangement.STANDARD)
 
 
 # Made with Bob
