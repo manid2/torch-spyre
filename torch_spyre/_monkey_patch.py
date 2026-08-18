@@ -32,6 +32,7 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     import torch
+    from torch_spyre.dtype_ops import DtypeOpTable
 
     # Skip FakeTensor tracing contexts during torch.compile
     if (
@@ -42,15 +43,11 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     from torch_spyre._C import (
-        ElementArrangement,
         get_spyre_tensor_layout,
         set_spyre_tensor_layout,
     )
 
-    # Determine appropriate EA tag based on source EA and conversion direction.
     # TODO EA torch.bool as it can be fp16 or fp32
-    # TODO Use common function to set EA as this is already done in
-    # torch_spyre/_inductor/propagate_layouts.py need to reuse it here.
 
     try:
         src_layout = get_spyre_tensor_layout(src_tensor)
@@ -60,62 +57,18 @@ def _add_ea(src_tensor, res_tensor) -> None:
     if src_layout is None:
         return
 
-    EA_MAP = {
-        (
-            torch.float16,
-            torch.float32,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.DL16_TO_FP32,
-        (
-            torch.bfloat16,
-            torch.float32,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.DL16_TO_FP32,
-        (
-            torch.float16,
-            torch.float32,
-            ElementArrangement.FP32_TO_DL16,
-        ): ElementArrangement.STANDARD,
-        (
-            torch.bfloat16,
-            torch.float32,
-            ElementArrangement.FP32_TO_DL16,
-        ): ElementArrangement.STANDARD,
-        (
-            torch.float32,
-            torch.float16,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.FP32_TO_DL16,
-        (
-            torch.float32,
-            torch.bfloat16,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.FP32_TO_DL16,
-        (
-            torch.float32,
-            torch.float16,
-            ElementArrangement.DL16_TO_FP32,
-        ): ElementArrangement.STANDARD,
-        (
-            torch.float32,
-            torch.bfloat16,
-            ElementArrangement.DL16_TO_FP32,
-        ): ElementArrangement.STANDARD,
-    }
-
-    fmt = EA_MAP.get(
-        (src_tensor.dtype, res_tensor.dtype, src_layout.element_arrangement)
+    fmt = DtypeOpTable.ea_map(
+        src_tensor.dtype, res_tensor.dtype, src_layout.element_arrangement
     )
 
-    if fmt is not None:
-        try:
-            res_layout = get_spyre_tensor_layout(res_tensor)
-        except RuntimeError:
-            return
+    try:
+        res_layout = get_spyre_tensor_layout(res_tensor)
+    except RuntimeError:
+        return
 
-        if res_layout is not None:
-            new_layout = res_layout.with_element_arrangement(fmt)
-            set_spyre_tensor_layout(res_tensor, new_layout)
+    if res_layout is not None:
+        new_layout = res_layout.with_element_arrangement(fmt)
+        set_spyre_tensor_layout(res_tensor, new_layout)
 
 
 def _patch_tensor_for_spyre():

@@ -23,13 +23,14 @@ from typing import Mapping, Optional
 
 import torch
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
     DL16TOFP32_OP,
     FP32TODL16_OP,
     FP8TODL16_OP,
 )
+from .errors import Unsupported
 
 # Spyre has no native bool: a bool tensor reuses whichever physical format
 # produced it (e.g. fp16 vs fp32 comparison results). Maps that format to
@@ -43,6 +44,44 @@ _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
 def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
     """Logical dtype matching a bool's physical format, or None if unsupported."""
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
+
+
+FP16_TYPES = [torch.float16, torch.bfloat16]
+
+EA_MAP = {
+    **{
+        (
+            dt,
+            torch.float32,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.DL16_TO_FP32
+        for dt in FP16_TYPES
+    },
+    **{
+        (
+            dt,
+            torch.float32,
+            ElementArrangement.FP32_TO_DL16,
+        ): ElementArrangement.STANDARD
+        for dt in FP16_TYPES
+    },
+    **{
+        (
+            torch.float32,
+            dt,
+            ElementArrangement.STANDARD,
+        ): ElementArrangement.FP32_TO_DL16
+        for dt in FP16_TYPES
+    },
+    **{
+        (
+            torch.float32,
+            dt,
+            ElementArrangement.DL16_TO_FP32,
+        ): ElementArrangement.STANDARD
+        for dt in FP16_TYPES
+    },
+}
 
 
 class DtypeOpTable:
@@ -155,3 +194,19 @@ class DtypeOpTable:
     @classmethod
     def is_dtype_op(cls, op: str) -> bool:
         return op in cls._TYPECAST_OP_NAMES
+
+    @staticmethod
+    def ea_map(src_dtype, dst_dtype, src_ea) -> ElementArrangement:
+        fmt = EA_MAP.get((src_dtype, dst_dtype, src_ea))
+        if fmt is not None:
+            return fmt
+
+        if (src_dtype in FP16_TYPES and dst_dtype == torch.float32) or (
+            src_dtype == torch.float32 and dst_dtype in FP16_TYPES
+        ):
+            raise Unsupported(
+                f"{src_dtype}→{dst_dtype} conversion with unsupported input EA: {src_ea}"
+            )
+
+        # Other type conversions default to STANDARD
+        return ElementArrangement.STANDARD

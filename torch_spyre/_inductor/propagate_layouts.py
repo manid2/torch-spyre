@@ -51,7 +51,7 @@ from torch_spyre._C import (
     get_device_dtype,
     get_elem_in_stick,
 )
-from .dtype_ops import bool_equivalent_dtype
+from .dtype_ops import bool_equivalent_dtype, DtypeOpTable
 from .errors import Unsupported
 from .constants import (
     BATCH_MATMUL_OP,
@@ -501,36 +501,7 @@ def _single_arg_op_layout(
 
             input_ea = stl.element_arrangement
 
-            # Determine output EA based on conversion direction and input EA
-            if in_layout.dtype == torch.float16 and output.dtype == torch.float32:
-                # FP16 → FP32 conversion
-                if input_ea == ElementArrangement.STANDARD:
-                    # Case 1: STANDARD → DL16_TO_FP32 (creates staggered layout)
-                    fmt = ElementArrangement.DL16_TO_FP32
-                elif input_ea == ElementArrangement.FP32_TO_DL16:
-                    # Case 2: FP32_TO_DL16 → STANDARD (restoration)
-                    fmt = ElementArrangement.STANDARD
-                else:
-                    # Unexpected input EA for FP16→FP32
-                    raise Unsupported(
-                        f"FP16→FP32 conversion with unsupported input EA: {input_ea}"
-                    )
-            elif in_layout.dtype == torch.float32 and output.dtype == torch.float16:
-                # FP32 → FP16 conversion
-                if input_ea == ElementArrangement.STANDARD:
-                    # Case 3: STANDARD → FP32_TO_DL16 (creates staggered layout)
-                    fmt = ElementArrangement.FP32_TO_DL16
-                elif input_ea == ElementArrangement.DL16_TO_FP32:
-                    # Case 4: DL16_TO_FP32 → STANDARD (restoration)
-                    fmt = ElementArrangement.STANDARD
-                else:
-                    # Unexpected input EA for FP32→FP16
-                    raise Unsupported(
-                        f"FP32→FP16 conversion with unsupported input EA: {input_ea}"
-                    )
-            else:
-                # Other type conversions default to STANDARD
-                fmt = ElementArrangement.STANDARD
+            fmt = DtypeOpTable.ea_map(in_layout.dtype, output.dtype, input_ea)
 
             # Two strategies, chosen by whether a staggered EA is involved:
             #
