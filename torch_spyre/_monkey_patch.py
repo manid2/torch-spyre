@@ -32,7 +32,7 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     import torch
-    from torch_spyre.dtype_ops import DtypeOpTable
+    from torch_spyre._inductor.dtype_ops import DtypeOpTable
 
     # Skip FakeTensor tracing contexts during torch.compile
     if (

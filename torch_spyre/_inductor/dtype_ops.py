@@ -46,42 +46,18 @@ def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
 
 
-FP16_TYPES = [torch.float16, torch.bfloat16]
+def _build_ea_map(fp16_dtypes: list) -> dict:
+    EA = ElementArrangement
+    FP32 = torch.float32
 
-EA_MAP = {
-    **{
-        (
-            dt,
-            torch.float32,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.DL16_TO_FP32
-        for dt in FP16_TYPES
-    },
-    **{
-        (
-            dt,
-            torch.float32,
-            ElementArrangement.FP32_TO_DL16,
-        ): ElementArrangement.STANDARD
-        for dt in FP16_TYPES
-    },
-    **{
-        (
-            torch.float32,
-            dt,
-            ElementArrangement.STANDARD,
-        ): ElementArrangement.FP32_TO_DL16
-        for dt in FP16_TYPES
-    },
-    **{
-        (
-            torch.float32,
-            dt,
-            ElementArrangement.DL16_TO_FP32,
-        ): ElementArrangement.STANDARD
-        for dt in FP16_TYPES
-    },
-}
+    ea_map = {}
+    for FP16 in fp16_dtypes:
+        ea_map[(FP16, FP32, EA.STANDARD)] = EA.DL16_TO_FP32
+        ea_map[(FP16, FP32, EA.FP32_TO_DL16)] = EA.STANDARD
+        ea_map[(FP32, FP16, EA.STANDARD)] = EA.FP32_TO_DL16
+        ea_map[(FP32, FP16, EA.DL16_TO_FP32)] = EA.STANDARD
+
+    return ea_map
 
 
 class DtypeOpTable:
@@ -122,6 +98,9 @@ class DtypeOpTable:
     # over a DMA-copied host buffer with a different HBM ordering yields shuffled
     # elements, so host bool InputBuffers feeding one must fall back to CPU.
     _STICK_REORDERING_OPS = {DL16TOFP32_OP, FP32TODL16_OP, FP8TODL16_OP}
+
+    _FP16_TYPES = [torch.float16, torch.bfloat16]
+    _EA_MAP = _build_ea_map(_FP16_TYPES)
 
     @classmethod
     def get_operator(
@@ -195,14 +174,14 @@ class DtypeOpTable:
     def is_dtype_op(cls, op: str) -> bool:
         return op in cls._TYPECAST_OP_NAMES
 
-    @staticmethod
-    def ea_map(src_dtype, dst_dtype, src_ea) -> ElementArrangement:
-        fmt = EA_MAP.get((src_dtype, dst_dtype, src_ea))
+    @classmethod
+    def ea_map(cls, src_dtype, dst_dtype, src_ea) -> ElementArrangement:
+        fmt = cls._EA_MAP.get((src_dtype, dst_dtype, src_ea))
         if fmt is not None:
             return fmt
 
-        if (src_dtype in FP16_TYPES and dst_dtype == torch.float32) or (
-            src_dtype == torch.float32 and dst_dtype in FP16_TYPES
+        if (src_dtype in cls._FP16_TYPES and dst_dtype == torch.float32) or (
+            src_dtype == torch.float32 and dst_dtype in cls._FP16_TYPES
         ):
             raise Unsupported(
                 f"{src_dtype}→{dst_dtype} conversion with unsupported input EA: {src_ea}"
