@@ -39,6 +39,7 @@ import pytest
 import torch
 from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
 from torch_spyre._inductor.dtype_ops import DtypeOpTable
+from torch_spyre._inductor.constants import DEVICE_NAME
 
 
 @pytest.mark.parametrize("device", ["spyre"])
@@ -254,8 +255,13 @@ def test_stagger_to_standard_ea(x):
 # Eager-path unit tests
 # ---------------------------------------------------------------------------
 def get_ea(tensor):
-    layout = get_spyre_tensor_layout(tensor)
-    return layout.element_arrangement if layout else None
+    if tensor.device.type != DEVICE_NAME:
+        return None
+    try:
+        layout = get_spyre_tensor_layout(tensor)
+        return layout.element_arrangement if layout else None
+    except RuntimeError:
+        return None
 
 
 def assert_ea(tensor, expected_ea):
@@ -263,43 +269,78 @@ def assert_ea(tensor, expected_ea):
     assert actual_ea == expected_ea, f"Expected EA: {expected_ea}, Got EA: {actual_ea}"
 
 
+def ea_of(dev):
+    return ElementArrangement.STANDARD if dev == DEVICE_NAME else None
+
+
+def _build_eager_ea_tests():
+    eager_to = {
+        "to_kw_device_dtype": lambda x, d, dt: x.to(device=d, dtype=dt),
+        "to_pos_device_kw_dtype": lambda x, d, dt: x.to(d, dtype=dt),
+        "to_pos_device_dtype": lambda x, d, dt: x.to(d, dt),
+        "to_torch_device_dtype": lambda x, d, dt: x.to(torch.device(d), dt),
+    }
+
+    device_pairs = [
+        (DEVICE_NAME, DEVICE_NAME),
+        (DEVICE_NAME, "cpu"),
+        ("cpu", DEVICE_NAME),
+        ("cpu", "cpu"),
+    ]
+
+    unsupported_dci_pairs = [
+        (torch.float32, torch.float16),
+    ]
+
+    test_cases = []
+    test_ids = []
+
+    for src_dev, dst_dev in device_pairs:
+        same_device = src_dev == dst_dev
+        for fp16 in DtypeOpTable.fp16_types():
+            is_unsupported = (torch.float32, fp16) in unsupported_dci_pairs
+            if not same_device and is_unsupported:
+                continue
+
+            for _id, _to in eager_to.items():
+                test_cases.append((src_dev, dst_dev, fp16, _to))
+
+                dt_name = str(fp16).replace("torch.", "")
+                test_ids.append(f"{src_dev}->{dst_dev}-{dt_name}-{_id}")
+
+    return test_cases, test_ids
+
+
+EAGER_TO_TEST_CASES, EAGER_TO_TEST_IDS = _build_eager_ea_tests()
+
+
 @pytest.mark.filterwarnings("ignore::UserWarning")
-@pytest.mark.parametrize("device", ["spyre"])
-@pytest.mark.parametrize("fp16", DtypeOpTable.fp16_types())
 @pytest.mark.parametrize(
-    "eager_to",
-    [
-        lambda x, d, dt: x.to(device=d, dtype=dt),
-        lambda x, d, dt: x.to(d, dtype=dt),
-        lambda x, d, dt: x.to(d, dt),
-        lambda x, d, dt: x.to(torch.device(d), dt),
-    ],
+    "src_dev, dst_dev, fp16, eager_to",
+    EAGER_TO_TEST_CASES,
+    ids=EAGER_TO_TEST_IDS,
 )
-def test_eager_ea(device, fp16, eager_to):
-    """Verify eager mode EA."""
-    # FP16 eager EA STANDARD
-    x_16 = torch.randn(4, 128, device=device, dtype=fp16)
-    assert_ea(x_16, ElementArrangement.STANDARD)
+def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
+    """Verify eager mode EA across device transfer combinations."""
+    # FP16 -> FP32 casting flow
+    x16 = torch.randn(4, 128, device=src_dev, dtype=fp16)
+    assert_ea(x16, ea_of(src_dev))
 
-    # FP16 -> FP32 via eager CPU-intermediate path produces STANDARD EA
-    res_32 = eager_to(x_16, device, torch.float32)
-    assert_ea(res_32, ElementArrangement.STANDARD)
+    y32 = eager_to(x16, dst_dev, torch.float32)
+    assert_ea(y32, ea_of(dst_dev))
 
-    # FP32 with EA STANDARD -> FP16 restores EA STANDARD
-    res_16_restored = eager_to(res_32, device, fp16)
-    assert_ea(res_16_restored, ElementArrangement.STANDARD)
+    z16 = eager_to(y32, src_dev, fp16)
+    assert_ea(z16, ea_of(src_dev))
 
-    # FP32 eager EA STANDARD
-    x_32 = torch.randn(4, 128, device=device, dtype=torch.float32)
-    assert_ea(x_32, ElementArrangement.STANDARD)
+    # FP32 -> FP16 casting flow
+    x32 = torch.randn(4, 128, device=src_dev, dtype=torch.float32)
+    assert_ea(x32, ea_of(src_dev))
 
-    # FP32 -> FP16 via eager CPU-intermediate path produces STANDARD EA
-    res_16 = eager_to(x_32, device, fp16)
-    assert_ea(res_16, ElementArrangement.STANDARD)
+    y16 = eager_to(x32, dst_dev, fp16)
+    assert_ea(y16, ea_of(dst_dev))
 
-    # FP16 with EA STANDARD -> FP32 restores EA STANDARD
-    res_32_restored = eager_to(res_16, device, torch.float32)
-    assert_ea(res_32_restored, ElementArrangement.STANDARD)
+    z32 = eager_to(y16, src_dev, torch.float32)
+    assert_ea(z32, ea_of(src_dev))
 
 
 @pytest.mark.parametrize("device", ["spyre"])
