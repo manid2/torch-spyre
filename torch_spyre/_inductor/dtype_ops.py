@@ -187,6 +187,11 @@ class DtypeOpTable:
         return op in cls._TYPECAST_OP_NAMES
 
     @classmethod
+    def op_names(cls) -> frozenset[str]:
+        """All op names this table can produce (e.g. for op-name validation)."""
+        return frozenset(cls._TYPECAST_OP_NAMES)
+
+    @classmethod
     def fp16_types(cls) -> list:
         return cls._FP16_TYPES
 
