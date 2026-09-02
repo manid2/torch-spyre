@@ -185,7 +185,13 @@ def _pick_stick_dim(stick_expr, out_coords) -> int:
 
 
 def _output_stl_from_stick_expr(
-    stick_expr, output, output_dep, c_size, c_stride, dtype=None
+    stick_expr,
+    output,
+    output_dep,
+    c_size,
+    c_stride,
+    dtype=None,
+    element_arrangement=ElementArrangement.STANDARD,
 ) -> SpyreTensorLayout | None:
     """If stick_expr is offset-free, build an output STL with it mapped to the right dim.
 
@@ -197,7 +203,9 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
+    return _make_output_stl(
+        output, output_dep, c_size, c_stride, out_stick_dim, dtype, element_arrangement
+    )
 
 
 def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
@@ -218,7 +226,13 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim, dtype=None
+    output,
+    output_dep,
+    c_size,
+    c_stride,
+    stick_dim,
+    dtype=None,
+    element_arrangement=ElementArrangement.STANDARD,
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
@@ -230,7 +244,7 @@ def _make_output_stl(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
-    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
+    stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order, element_arrangement)
     coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
@@ -418,6 +432,16 @@ def _single_arg_op_layout(
         )
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
+        # Propagate staggered ElementArrangement from input to output. A
+        # reduction collapses dimensions but does not reformat surviving
+        # elements, so the physical element interleaving (e.g. DL16_TO_FP32)
+        # must be preserved on the output tensor.
+        out_ea = (
+            stl.element_arrangement
+            if stl.element_arrangement in STAGGERED_EAS
+            else ElementArrangement.STANDARD
+        )
+
         x_dev_coords = try_device_coordinates(stl, dep, None)
         if x_dev_coords is None:
             return []
@@ -436,7 +460,13 @@ def _single_arg_op_layout(
         ):
             # Try to preserve input layout
             out_stl = _output_stl_from_stick_expr(
-                x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+                x_stick_expr,
+                output,
+                output_dep,
+                c_size,
+                c_stride,
+                out_dtype_for_layout,
+                out_ea,
             )
             if out_stl is not None:
                 return [out_stl]
@@ -473,6 +503,7 @@ def _single_arg_op_layout(
                     c_stride,
                     out_stick_dim,
                     out_dtype_for_layout,
+                    out_ea,
                 )
                 if out_stl is not None:
                     layouts.append(out_stl)
