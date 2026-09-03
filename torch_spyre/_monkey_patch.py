@@ -50,8 +50,6 @@ def _add_ea(src_tensor, res_tensor) -> None:
         set_spyre_tensor_layout,
     )
 
-    # TODO EA torch.bool as it can be fp16 or fp32
-
     try:
         src_layout = get_spyre_tensor_layout(src_tensor)
     except RuntimeError:
@@ -61,7 +59,22 @@ def _add_ea(src_tensor, res_tensor) -> None:
         return
 
     input_ea = src_layout.element_arrangement
-    fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
+
+    # torch.bool has no native Spyre dtype: it reuses the physical format of
+    # whatever op produced it (fp16 or fp32).  Resolve the logical equivalent
+    # so ea_map can look up the correct FP16↔FP32 EA transition.
+    if src_tensor.dtype == torch.bool:
+        from torch_spyre._inductor.dtype_ops import bool_equivalent_dtype
+
+        bool_src_dtype = bool_equivalent_dtype(src_layout.device_dtype)
+        if bool_src_dtype is None:
+            # Unknown physical format – leave EA unchanged (STANDARD fallback)
+            return
+        effective_src_dtype = bool_src_dtype
+    else:
+        effective_src_dtype = src_tensor.dtype
+
+    fmt = DtypeOpTable.ea_map(effective_src_dtype, res_tensor.dtype, input_ea)
 
     # FP32 -> FP16 runtime type conversion is not supported by DCI for torch.float16,
     # but is supported for torch.bfloat16 and torch.bool (as per isDCIConversionSupported).
