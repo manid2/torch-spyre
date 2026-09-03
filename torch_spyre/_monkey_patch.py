@@ -63,11 +63,9 @@ def _add_ea(src_tensor, res_tensor) -> None:
     input_ea = src_layout.element_arrangement
     fmt = DtypeOpTable.ea_map(src_tensor.dtype, res_tensor.dtype, input_ea)
 
-    # FP32 -> FP16 runtime type conversion is not yet supported.
-    if (
-        src_tensor.dtype == torch.float32
-        and res_tensor.dtype in DtypeOpTable.fp16_types()
-    ):
+    # FP32 -> FP16 runtime type conversion is not supported by DCI for torch.float16,
+    # but is supported for torch.bfloat16 and torch.bool (as per isDCIConversionSupported).
+    if src_tensor.dtype == torch.float32 and res_tensor.dtype == torch.float16:
         fmt = ElementArrangement.STANDARD
 
     try:

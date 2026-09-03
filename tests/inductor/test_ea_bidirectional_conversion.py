@@ -128,9 +128,11 @@ def test_fp32_to_fp16_standard_input(device, mode, fp16):
     result = _run(fn, x, mode=mode)
 
     # Verify output EA
-    expected_ea = ElementArrangement.STANDARD
-    if mode == "compile":
-        expected_ea = ElementArrangement.FP32_TO_DL16
+    expected_ea = (
+        ElementArrangement.FP32_TO_DL16
+        if mode == "compile" or fp16 != torch.float16
+        else ElementArrangement.STANDARD
+    )
     assert_ea(result, expected_ea)
 
     # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
@@ -145,10 +147,10 @@ def test_fp32_to_fp16_standard_input(device, mode, fp16):
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_fp16_to_fp32_restoration(device, fp16):
+@pytest.mark.parametrize("mode", ["compile", "eager"])
+def test_fp16_to_fp32_restoration(device, mode, fp16):
     """Test FP16→FP32 with FP32_TO_DL16 input restores to STANDARD."""
 
-    @torch.compile
     def fn(x):
         # FP32 → FP16 (creates FP32_TO_DL16)
         x_fp16 = x.to(dtype=fp16)
@@ -156,7 +158,7 @@ def test_fp16_to_fp32_restoration(device, fp16):
         return x_fp16.to(torch.float32)
 
     x = torch.randn(4, 128, device=device, dtype=torch.float32)
-    result = fn(x)
+    result = _run(fn, x, mode=mode)
 
     # Verify output EA is STANDARD (restored)
     assert_ea(result, ElementArrangement.STANDARD)
@@ -164,19 +166,19 @@ def test_fp16_to_fp32_restoration(device, fp16):
     # Verify correctness
     assert_val(fn, x, result)
 
-    print("✓ FP16→FP32 restoration (FP32_TO_DL16 → STANDARD) works")
+    print(f"✓ FP16→FP32 restoration (FP32_TO_DL16 → STANDARD) works ({mode})")
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_fp32_to_fp16_restoration(device, fp16):
+def test_fp32_to_fp16_restoration(device, mode, fp16):
     """Test FP32→FP16 with DL16_TO_FP32 input restores to STANDARD."""
 
-    @torch.compile
     def fn(x):
         # FP16 → FP32 (creates DL16_TO_FP32)
         x_fp32 = x.to(torch.float32)
@@ -184,7 +186,7 @@ def test_fp32_to_fp16_restoration(device, fp16):
         return x_fp32.to(dtype=fp16)
 
     x = torch.randn(4, 128, device=device, dtype=fp16)
-    result = fn(x)
+    result = _run(fn, x, mode=mode)
 
     # Verify output EA is STANDARD (restored)
     assert_ea(result, ElementArrangement.STANDARD)
@@ -192,26 +194,26 @@ def test_fp32_to_fp16_restoration(device, fp16):
     # Verify correctness
     assert_val(fn, x, result)
 
-    print("✓ FP32→FP16 restoration (DL16_TO_FP32 → STANDARD) works")
+    print(f"✓ FP32→FP16 restoration (DL16_TO_FP32 → STANDARD) works ({mode})")
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp16_start(device, fp16):
+def test_bidirectional_roundtrip_fp16_start(device, mode, fp16):
     """Test FP16→FP32→FP16 roundtrip."""
 
-    @torch.compile
     def fn(x):
         # FP16(STANDARD) → FP32(DL16_TO_FP32) → FP16(STANDARD)
         x_fp32 = x.to(torch.float32)
         return x_fp32.to(dtype=fp16)
 
     x = torch.randn(4, 128, device=device, dtype=fp16)
-    result = fn(x)
+    result = _run(fn, x, mode=mode)
 
     # Verify final EA is STANDARD
     assert_ea(result, ElementArrangement.STANDARD)
@@ -219,26 +221,26 @@ def test_bidirectional_roundtrip_fp16_start(device, fp16):
     # Verify correctness
     assert_val(fn, x, result)
 
-    print("✓ FP16→FP32→FP16 roundtrip works")
+    print(f"✓ FP16→FP32→FP16 roundtrip works ({mode})")
 
 
 @pytest.mark.parametrize("device", ["spyre"])
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 @pytest.mark.parametrize(
     "fp16",
     DtypeOpTable.fp16_types(),
     ids=lambda dt: str(dt).replace("torch.", ""),
 )
-def test_bidirectional_roundtrip_fp32_start(device, fp16):
+def test_bidirectional_roundtrip_fp32_start(device, mode, fp16):
     """Test FP32→FP16→FP32 roundtrip."""
 
-    @torch.compile
     def fn(x):
         # FP32(STANDARD) → FP16(FP32_TO_DL16) → FP32(STANDARD)
         x_fp16 = x.to(dtype=fp16)
         return x_fp16.to(torch.float32)
 
     x = torch.randn(4, 128, device=device, dtype=torch.float32)
-    result = fn(x)
+    result = _run(fn, x, mode=mode)
 
     # Verify final EA is STANDARD
     assert_ea(result, ElementArrangement.STANDARD)
@@ -246,7 +248,7 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     # Verify correctness
     assert_val(fn, x, result)
 
-    print("✓ FP32→FP16→FP32 roundtrip works")
+    print(f"✓ FP32→FP16→FP32 roundtrip works ({mode})")
 
 
 def _stagger_fn(x, fp16):
