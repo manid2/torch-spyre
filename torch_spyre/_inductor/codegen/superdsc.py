@@ -1957,8 +1957,8 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         DtypeOpTable.is_dtype_op(op_spec.op) and op_spec.op != IDENTITY_OP
     )
 
-    if is_non_identity_dtype_op and op_stick_dim is None:
-        input_stick_label_idx = ndim if ndim != 0 else ndim + 1
+    if is_non_identity_dtype_op and ndim == 0 and op_stick_dim is None:
+        input_stick_label_idx = 1  # ndim=0, so use INPUT_DIM_LABELS[1] = "x"
         input_stick_sym = Symbol(INPUT_DIM_LABELS[input_stick_label_idx])
         sdsc_iteration_space[input_stick_sym] = op_spec.args[
             0
