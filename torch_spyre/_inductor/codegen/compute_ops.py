@@ -23,6 +23,7 @@ from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     DEPTHWISE_CONV2D_OP,
     FP8_2D_STICK_OPS,
+    STAGGERED_EA_TO_SDSC_NAME,
 )
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.op_spec import TensorWorkDivision
@@ -1464,7 +1465,9 @@ def generate_sdsc(
                             # any tensor-specific layout adjustments (e.g. FP8 2D-stick override).
                             "primaryDsInfo_": {
                                 tensor.layout: (
-                                    lambda layout_info, label=tensor.layout: {
+                                    lambda layout_info,
+                                    label=tensor.layout,
+                                    ea=tensor.element_arrangement: {
                                         "layoutDimOrder_": [
                                             str(dim)
                                             for dim in _filter_window_dims(
@@ -1479,6 +1482,19 @@ def generate_sdsc(
                                         **(
                                             {"stickRepl_": [1]}
                                             if sdsc_spec.stick_replication
+                                            else {}
+                                        ),
+                                        # Emit elemArrangement_ for non-STANDARD
+                                        # arrangements so the deeptools shuffle op
+                                        # backend can handle staggered↔STANDARD
+                                        # element reordering (deeptools PR #4651).
+                                        **(
+                                            {
+                                                "elemArrangement_": STAGGERED_EA_TO_SDSC_NAME[
+                                                    ea
+                                                ]
+                                            }
+                                            if ea in STAGGERED_EA_TO_SDSC_NAME
                                             else {}
                                         ),
                                     }

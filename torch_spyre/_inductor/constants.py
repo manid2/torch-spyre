@@ -18,6 +18,7 @@ from torch_spyre._C import ElementArrangement
 
 BATCH_MATMUL_OP = "batchmatmul"
 IDENTITY_OP = "identity"
+EA_SHUFFLE_OP = "ea_shuffle"
 RESTICKIFY_OP = "ReStickifyOpHBM"
 DEPTHWISE_CONV2D_OP = "depthwiseconv2dnative"
 BATCH_MATMUL_FP8_OP = "batchmatmulfp8"
@@ -56,6 +57,15 @@ STAGGERED_EAS = frozenset(
         ElementArrangement.FP32_TO_DL16,
     }
 )
+
+# Maps staggered ElementArrangement values to the SDSC field name used in the
+# deeptools SuperDSC JSON when emitting elemArrangement_ for a shuffle op.
+# STANDARD has no SDSC field (absence means standard ordering); only the
+# two staggered conversion modes need an explicit annotation.
+STAGGERED_EA_TO_SDSC_NAME: dict = {
+    ElementArrangement.DL16_TO_FP32: "DL16_TO_FP32",
+    ElementArrangement.FP32_TO_DL16: "FP32_TO_DL16",
+}
 
 
 def is_ea_compatible(eas) -> bool:

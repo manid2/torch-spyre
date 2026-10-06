@@ -29,6 +29,7 @@ from torch_spyre._inductor.constants import (
     CONV_DIM_LABELS,
     CONV_OPS,
     DEPTHWISE_CONV2D_OP,
+    EA_SHUFFLE_OP,
     FP32TOINT32_OP,
     IDENTITY_OP,
     INPUT_DIM_LABELS,
@@ -88,6 +89,9 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     device_tile_advance_expr: Expr | None = None
+    element_arrangement: ElementArrangement = dataclasses.field(
+        default_factory=lambda: ElementArrangement.STANDARD
+    )
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -1637,6 +1641,7 @@ def _create_sdsc_tensors(
             is_index_tensor=is_idx_tensor,
             related_value_tensor_idx=related_val_idx,
             device_tile_advance_expr=arg.device_tile_advance_expr,
+            element_arrangement=arg.element_arrangement,
         )
         if arg.work_division is not None:
             sdsc_arg.work_division = arg.work_division.remap_symbols(symbol_mapping)
@@ -2294,9 +2299,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0]],
             [args[0].dim_order],
         )
-    elif is_restickify:
+    elif is_restickify or op_spec.op == EA_SHUFFLE_OP:
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
+        # EA_SHUFFLE_OP (element-arrangement shuffle) also has potentially
+        # different arrangements on input and output and needs both padded.
         pad_args, pad_sdsc_args, dim_order = (
             list(op_spec.args),
             args,
@@ -2485,7 +2492,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         SDSCSpec(
             opfunc=(
                 "shuffle"
-                if is_relayout
+                if is_relayout or op_spec.op == EA_SHUFFLE_OP
                 else _get_op_func(op_spec.op, op_spec.is_reduction, args[-1].scales)
             ),
             # Forward conv2d (#3284) is a native "pt" (processing-tile) op like
