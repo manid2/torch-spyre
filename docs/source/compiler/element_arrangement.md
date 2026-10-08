@@ -124,3 +124,91 @@ How it works:
 * **Host Stride Identification:** The stick dimension is identified by its
   **HOST stride** (one stick's worth of host columns), not its device stride,
   as the device may use different internal ordering (e.g., stick-major).
+
+### Restoring EA FP32_TO_DL16 to STANDARD
+
+When two FP32 sticks (32 elements each) are narrowed to 16-bit, their data is
+packed into a single 16-bit stick of 64 elements. The element groups of the
+two FP32 sticks are interleaved, which is the inverse of the `DL16_TO_FP32`
+distribution:
+
+* Groups of the first FP32 stick (`half0`) go to the **even** group slots.
+* Groups of the second FP32 stick (`half1`) go to the **odd** group slots.
+
+Unlike `DL16_TO_FP32`, the staggering stays inside a **single** 16-bit stick,
+so there is no stick pairing.
+
+* **Element Group:** A set of 4 consecutive host elements.
+* **Half:** 32 consecutive host columns within one 64-column stick, matching
+  one source FP32 stick.
+
+#### Visual Representation
+
+Consider one host row spanning one 16-bit stick (64 columns):
+
+**Host Logical Order:**
+
+```text
+Columns:  [ 0..3 ] [ 4..7 ] ... [ 28..31 ] [ 32..35 ] ... [ 60..63 ]
+Groups:   [  G0  ] [  G1  ] ... [  G7   ] [  G8   ] ... [  G15  ]
+          |<------ half 0 ------>|<------- half 1 ------->|
+```
+
+**Device Physical Storage (one 16-bit stick):**
+
+```text
+Pos:      [ 0..3 ] [ 4..7 ] [ 8..11 ] [ 12..15 ] ... [ 56..59 ] [ 60..63 ]
+Groups:   [  G0  ] [  G8  ] [  G1   ] [  G9    ] ... [  G7   ] [  G15  ]
+```
+
+To reconstruct the host row, one must read $G_0$ from pos 0..3, $G_1$ from
+pos 8..11, ..., $G_7$ from pos 56..59, then $G_8$ from pos 4..7, and so on.
+
+#### Index Mapping
+
+A host column index within a stick is decomposed into three components:
+
+$$
+\text{host\_col} = (\text{stick} \times 64) + (\text{half\_in\_stick} \times 32) + (\text{group\_in\_half} \times 4) + \text{elem\_in\_group}
+$$
+
+| Component | Range | Description |
+| :--- | :--- | :--- |
+| `stick` | $[0, N)$ | Identifies the 16-bit stick. |
+| `half_in_stick` | $[0, 2)$ | Identifies which half of the stick's host columns. |
+| `group_in_half` | $[0, 8)$ | Identifies the group within a half. |
+| `elem_in_group` | $[0, 4)$ | Identifies the specific element within the group. |
+
+The corresponding device location is calculated as:
+
+* **Device Stick:** $\text{stick}$
+* **Device Position:** $\text{group\_in\_half} \times 8 + \text{half\_in\_stick} \times 4 + \text{elem\_in\_group}$
+
+#### Solution Approach 1: Split the DCSI loops
+
+Only dim 0 is split. All other dimensions, including the stick dimension, are
+copied unchanged.
+
+| Original Dimension | New Loop | Size | Src Step (Device) | Dst Step (Host) | Logic |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Dim 0**<br>(64 elements) | `elem_in_group` | 4 | 1 elem | 1 col | Accesses individual elements. |
+| | `half_in_stick` | 2 | 4 elems | 32 cols | Switches between the two interleaved halves. |
+| | `group_in_half` | 8 | 8 elems | 4 cols | Moves to the next group of the same half. |
+
+How it works:
+
+1. **`half_in_stick` Loop:** Advancing this loop moves the device pointer by
+   one group (4 elements) but jumps half a stick (32 columns) on the host.
+2. **`group_in_half` Loop:** Advancing this loop skips the group of the other
+   half on the device (8 elements) but advances only one group (4 columns) on
+   the host.
+
+The device side is walked contiguously (steps 1, 4, 8 elements).
+
+Constraints:
+
+* **Full Sticks Only:** Dim 0 must cover a complete 16-bit stick.
+* **Stick Size:** The stick size must be divisible by 8 (2 halves $\times$ 4
+  elements per group).
+* No even-stick-count requirement and no stick dimension identification are
+  needed, since the stagger never crosses a stick boundary.
