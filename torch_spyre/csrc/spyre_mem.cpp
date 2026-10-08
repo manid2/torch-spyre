@@ -462,6 +462,40 @@ void ea_restore_fp16tofp32(DataConversionStrideInfo& dcsi,
   dcsi.stride_dst_ = std::move(new_stride_dst);
 }
 
+void ea_restore_fp32tofp16(DataConversionStrideInfo& dcsi,
+                           const SpyreTensorLayout& stl,
+                           int64_t elems_per_group, int64_t halves_per_stick) {
+  const int64_t eps = stl.elems_per_stick();
+  TORCH_CHECK(dcsi.size_.size() == stl.stride_map.size(),
+              "Unexpected DCI rank for element arrangement restoration");
+  TORCH_CHECK(dcsi.size_[0] == eps,
+              elementArrangementToString(stl.element_arrangement),
+              " D2H requires full sticks (", eps,
+              " elements), got a partial stick of ", dcsi.size_[0]);
+
+  const int64_t src = dcsi.stride_src_[0];
+  const int64_t dst = dcsi.stride_dst_[0];
+  const int64_t groups_per_half = eps / (halves_per_stick * elems_per_group);
+
+  // dim 0 -> elem_in_group, half_in_stick, group_in_half
+  std::vector<int64_t> new_sizes = {elems_per_group, halves_per_stick,
+                                    groups_per_half};
+  std::vector<int64_t> new_stride_src = {
+      src, elems_per_group * src, halves_per_stick * elems_per_group * src};
+  std::vector<int64_t> new_stride_dst = {dst, (eps / halves_per_stick) * dst,
+                                         elems_per_group * dst};
+
+  for (size_t k = 1; k < dcsi.size_.size(); k++) {
+    new_sizes.push_back(dcsi.size_[k]);
+    new_stride_src.push_back(dcsi.stride_src_[k]);
+    new_stride_dst.push_back(dcsi.stride_dst_[k]);
+  }
+
+  dcsi.size_ = std::move(new_sizes);
+  dcsi.stride_src_ = std::move(new_stride_src);
+  dcsi.stride_dst_ = std::move(new_stride_dst);
+}
+
 /**
  * Restore standard element arrangement for DL16_TO_FP32 layout across all DCSI
  * entries.
@@ -473,11 +507,13 @@ void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
                 const SpyreTensorLayout& stl) {
   constexpr int64_t kElemsPerGroup = 4;
   constexpr int64_t kSticksPerPair = 2;
+  constexpr int64_t kHalvesPerStick = 2;
 
   const ElementArrangement ea = stl.element_arrangement;
-  TORCH_CHECK(ea == ElementArrangement::DL16_TO_FP32,
-              "Element arrangement expected "
-              "DL16_TO_FP32, got: ",
+  TORCH_CHECK(ea == ElementArrangement::DL16_TO_FP32 ||
+                  ea == ElementArrangement::FP32_TO_DL16,
+              "Element arrangement expected DL16_TO_FP32 or FP32_TO_DL16, "
+              "got: ",
               elementArrangementToString(ea));
 
   const int64_t eps = stl.elems_per_stick();
@@ -486,7 +522,11 @@ void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
               elementArrangementToString(ea));
 
   for (auto& dcsi : dcsis) {
-    ea_restore_fp16tofp32(dcsi, stl, kElemsPerGroup, kSticksPerPair);
+    if (ea == ElementArrangement::DL16_TO_FP32) {
+      ea_restore_fp16tofp32(dcsi, stl, kElemsPerGroup, kSticksPerPair);
+    } else {
+      ea_restore_fp32tofp16(dcsi, stl, kElemsPerGroup, kHalvesPerStick);
+    }
   }
 }
 
@@ -931,7 +971,8 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
 
     // On D2H readback restore EA to STANDARD see issue #4393.
     if (!host2device &&
-        stl.element_arrangement == ElementArrangement::DL16_TO_FP32) {
+        (stl.element_arrangement == ElementArrangement::DL16_TO_FP32 ||
+         stl.element_arrangement == ElementArrangement::FP32_TO_DL16)) {
       ea_restore(dci.dcsi_, stl);
     }
 
