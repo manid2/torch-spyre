@@ -379,143 +379,114 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   return stride_infos;
 }
 
-// Number of consecutive host elements that stay together on the device.
-constexpr int64_t kElemsPerGroup = 4;
-// DL16_TO_FP32 interleaves element groups across 2 adjacent sticks.
-constexpr int64_t kSticksPerPair = 2;
-
-// Incrementally builds the rewritten loop nest (innermost loop first).
-struct LoopNest {
-  std::vector<int64_t> size;
-  std::vector<int64_t> stride_src;
-  std::vector<int64_t> stride_dst;
-
-  void add_loop(int64_t loop_size, int64_t src_step, int64_t dst_step) {
-    size.push_back(loop_size);
-    stride_src.push_back(src_step);
-    stride_dst.push_back(dst_step);
-  }
-};
-
-// Per-DCSI facts about the original (un-restored) loop nest.
-struct StickLoopInfo {
-  int64_t elems_per_stick;
-  int64_t src_elem_stride;   // device step between consecutive elements
-  int64_t dst_elem_stride;   // host step between consecutive elements
-  size_t stick_dim;          // index of the loop that walks sticks
-  int64_t num_sticks;        // trip count of the stick loop
-  int64_t src_stick_stride;  // device step between consecutive sticks
-};
-
-void check_dcsi_shape(const DataConversionStrideInfo& dcsi,
-                      const SpyreTensorLayout& stl, int64_t elems_per_stick) {
+void ea_restore_fp16tofp32(DataConversionStrideInfo& dcsi,
+                           const SpyreTensorLayout& stl,
+                           int64_t elems_per_group, int64_t sticks_per_pair) {
+  const int64_t eps = stl.elems_per_stick();
   TORCH_CHECK(dcsi.size_.size() == stl.stride_map.size(),
               "Unexpected DCI rank for element arrangement restoration");
-  TORCH_CHECK(dcsi.size_[0] == elems_per_stick,
+  TORCH_CHECK(dcsi.size_[0] == eps,
               elementArrangementToString(stl.element_arrangement),
-              " D2H requires full sticks (", elems_per_stick,
+              " D2H requires full sticks (", eps,
               " elements), got a partial stick of ", dcsi.size_[0]);
-}
 
-// Finds the loop that steps from one stick to the next along the host's
-// contiguous dimension: a non-trivial loop whose host stride is exactly one
-// stick of host elements.  Exactly one such loop must exist.
-size_t find_stick_dim(const DataConversionStrideInfo& dcsi,
-                      int64_t elems_per_stick) {
-  const int64_t host_stick_stride = elems_per_stick * dcsi.stride_dst_[0];
-  int64_t stick_dim = -1;
-  for (size_t k = 1; k < dcsi.size_.size(); k++) {
-    if (dcsi.size_[k] > 1 && dcsi.stride_dst_[k] == host_stick_stride) {
-      TORCH_CHECK(stick_dim < 0,
-                  "Ambiguous stick dimension for DL16_TO_FP32 D2H");
-      stick_dim = static_cast<int64_t>(k);
+  auto find_stick_dim = [&](const DataConversionStrideInfo& d, int64_t eps) {
+    const int64_t host_stick_stride = eps * d.stride_dst_[0];
+    int64_t stick_dim = -1;
+    for (size_t k = 1; k < d.size_.size(); k++) {
+      if (d.size_[k] > 1 && d.stride_dst_[k] == host_stick_stride) {
+        TORCH_CHECK(stick_dim < 0,
+                    "Ambiguous stick dimension for DL16_TO_FP32 D2H");
+        stick_dim = static_cast<int64_t>(k);
+      }
     }
-  }
-  TORCH_CHECK(stick_dim > 0 && dcsi.size_[stick_dim] % kSticksPerPair == 0,
-              "DL16_TO_FP32 D2H requires an even number of sticks along "
-              "the stick dimension");
-  return static_cast<size_t>(stick_dim);
-}
+    TORCH_CHECK(stick_dim > 0 && d.size_[stick_dim] % sticks_per_pair == 0,
+                "DL16_TO_FP32 D2H requires an even number of sticks along "
+                "the stick dimension");
+    return static_cast<size_t>(stick_dim);
+  };
 
-StickLoopInfo analyze_dcsi(const DataConversionStrideInfo& dcsi,
-                           const SpyreTensorLayout& stl) {
-  const int64_t eps = stl.elems_per_stick();
-  check_dcsi_shape(dcsi, stl, eps);
+  auto split_element_dim = [&](std::vector<int64_t>& sizes,
+                               std::vector<int64_t>& stride_src,
+                               std::vector<int64_t>& stride_dst, int64_t eps,
+                               int64_t src_elem_stride,
+                               int64_t dst_elem_stride) {
+    sizes.push_back(elems_per_group);
+    stride_src.push_back(src_elem_stride);
+    stride_dst.push_back(dst_elem_stride);
 
-  StickLoopInfo g;
-  g.elems_per_stick = eps;
-  g.src_elem_stride = dcsi.stride_src_[0];
-  g.dst_elem_stride = dcsi.stride_dst_[0];
-  g.stick_dim = find_stick_dim(dcsi, eps);
-  g.num_sticks = dcsi.size_[g.stick_dim];
-  g.src_stick_stride = dcsi.stride_src_[g.stick_dim];
-  return g;
-}
+    sizes.push_back(eps / elems_per_group);
+    stride_src.push_back(elems_per_group * src_elem_stride);
+    stride_dst.push_back(sticks_per_pair * elems_per_group * dst_elem_stride);
+  };
 
-// dim 0 (elements of a stick)  ->  elem_in_group, group_in_stick
-void split_element_dim(LoopNest& nest, const StickLoopInfo& g) {
-  // elem_in_group: contiguous on both sides.
-  nest.add_loop(kElemsPerGroup, g.src_elem_stride, g.dst_elem_stride);
-  // group_in_stick: next group on the device is 4 elements away; on the host
-  // it is 8 columns away (the other stick's group sits in between).
-  nest.add_loop(g.elems_per_stick / kElemsPerGroup,
-                kElemsPerGroup * g.src_elem_stride,
-                kSticksPerPair * kElemsPerGroup * g.dst_elem_stride);
-}
+  auto split_stick_dim =
+      [&](std::vector<int64_t>& sizes, std::vector<int64_t>& stride_src,
+          std::vector<int64_t>& stride_dst, int64_t num_sticks,
+          int64_t src_stick_stride, int64_t dst_elem_stride, int64_t eps) {
+        sizes.push_back(sticks_per_pair);
+        stride_src.push_back(src_stick_stride);
+        stride_dst.push_back(elems_per_group * dst_elem_stride);
 
-// stick dim (N sticks)  ->  stick_in_pair, stick_pair
-void split_stick_dim(LoopNest& nest, const StickLoopInfo& g) {
-  // stick_in_pair: a whole device stick away, but only one group (4 columns)
-  // away on the host.
-  nest.add_loop(kSticksPerPair, g.src_stick_stride,
-                kElemsPerGroup * g.dst_elem_stride);
-  // stick_pair: two sticks on the device, 2 * elems_per_stick columns on host.
-  nest.add_loop(g.num_sticks / kSticksPerPair,
-                kSticksPerPair * g.src_stick_stride,
-                kSticksPerPair * g.elems_per_stick * g.dst_elem_stride);
-}
+        sizes.push_back(num_sticks / sticks_per_pair);
+        stride_src.push_back(sticks_per_pair * src_stick_stride);
+        stride_dst.push_back(sticks_per_pair * eps * dst_elem_stride);
+      };
 
-void ea_restore_fp16tofp32(DataConversionStrideInfo& dcsi,
-                           const SpyreTensorLayout& stl) {
-  const StickLoopInfo g = analyze_dcsi(dcsi, stl);
+  const int64_t src_elem_stride = dcsi.stride_src_[0];
+  const int64_t dst_elem_stride = dcsi.stride_dst_[0];
+  const size_t stick_dim = find_stick_dim(dcsi, eps);
+  const int64_t num_sticks = dcsi.size_[stick_dim];
+  const int64_t src_stick_stride = dcsi.stride_src_[stick_dim];
 
-  LoopNest nest;
+  std::vector<int64_t> new_sizes;
+  std::vector<int64_t> new_stride_src;
+  std::vector<int64_t> new_stride_dst;
+
   for (size_t k = 0; k < dcsi.size_.size(); k++) {
     if (k == 0) {
-      split_element_dim(nest, g);
-    } else if (k == g.stick_dim) {
-      split_stick_dim(nest, g);
+      split_element_dim(new_sizes, new_stride_src, new_stride_dst, eps,
+                        src_elem_stride, dst_elem_stride);
+    } else if (k == stick_dim) {
+      split_stick_dim(new_sizes, new_stride_src, new_stride_dst, num_sticks,
+                      src_stick_stride, dst_elem_stride, eps);
     } else {
-      nest.add_loop(dcsi.size_[k], dcsi.stride_src_[k], dcsi.stride_dst_[k]);
+      new_sizes.push_back(dcsi.size_[k]);
+      new_stride_src.push_back(dcsi.stride_src_[k]);
+      new_stride_dst.push_back(dcsi.stride_dst_[k]);
     }
   }
-  dcsi.size_ = std::move(nest.size);
-  dcsi.stride_src_ = std::move(nest.stride_src);
-  dcsi.stride_dst_ = std::move(nest.stride_dst);
+
+  dcsi.size_ = std::move(new_sizes);
+  dcsi.stride_src_ = std::move(new_stride_src);
+  dcsi.stride_dst_ = std::move(new_stride_dst);
 }
 
-/*
- * Restore STANDARD element arrangement in D2H tensor copy of staggered
- * SpyreTensorLayout.
+/**
+ * Restore standard element arrangement for DL16_TO_FP32 layout across all DCSI
+ * entries.
  *
- * DL16_TO_FP32 (device fp32, stick = 32 elems, sticks come in pairs):
- *   host col = blk * 64 + q * 8 + a * 4 + r
- *   device stick j = 2 * blk + a, position e = q * 4 + r      (r < 4, q < 8)
+ * @param dcsis Vector of data conversion stride infos to modify.
+ * @param stl SpyreTensorLayout describing the element arrangement.
  */
 void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
                 const SpyreTensorLayout& stl) {
+  constexpr int64_t kElemsPerGroup = 4;
+  constexpr int64_t kSticksPerPair = 2;
+
   const ElementArrangement ea = stl.element_arrangement;
   TORCH_CHECK(ea == ElementArrangement::DL16_TO_FP32,
-              "Element arrangement restoration is only supported for "
+              "Element arrangement expected "
               "DL16_TO_FP32, got: ",
               elementArrangementToString(ea));
+
   const int64_t eps = stl.elems_per_stick();
   TORCH_CHECK(eps > 0 && eps % (kSticksPerPair * kElemsPerGroup) == 0,
               "Unsupported stick size ", eps, " for element arrangement ",
               elementArrangementToString(ea));
 
   for (auto& dcsi : dcsis) {
-    ea_restore_fp16tofp32(dcsi, stl);
+    ea_restore_fp16tofp32(dcsi, stl, kElemsPerGroup, kSticksPerPair);
   }
 }
 
