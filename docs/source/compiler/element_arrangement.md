@@ -1,109 +1,126 @@
 Element arrangement
 ===
 
+In the Spyre device, tensors are packed into 128 Byte sticks that hold 64
+elements at 16-bit precision or 32 elements at 32-bit (FP32) precision.
+
+When a tensor precision is widened from 16-bit (`DL16`/`BF16`) to 32-bit
+(`FP32`) on the device, the elements cannot remain in both their original
+physical location and logical order. The reverse type conversion is also same.
+To avoid redistributing data across multiple sticks, the conversion leaves the
+elements **staggered** within the sticks.
+
+But due to requirements to support new models there is a need to restore
+or apply different element arrangements on Spyre. This document describes the
+element arrangement and its awareness through the model compilation graph.
+
 Restore EA D2H
 ---
 
 Restore STANDARD element arrangement in a D2H copy of a tensor whose
 SpyreTensorLayout has a staggered element arrangement.
 
----------------------------------------------------------------------------
-1. What the device holds (DL16_TO_FP32)
----------------------------------------------------------------------------
-A 16-bit tensor was widened to fp32 on the device.  The device stores the
-fp32 values in sticks of 32 elements, and the elements are NOT in logical
-order.  Terminology:
+### Restoring EA DL16_TO_FP32 to STANDARD
 
-  element group   4 consecutive host elements; always stay together.
-  stick pair      2 adjacent device sticks that together hold 64 host
-                  columns (2 sticks * 32 elements).
+When a 16-bit stick containing 16 element groups ($G_0$ to $G_{15}$) is upcast
+to FP32, the groups spill into two FP32 sticks. The distribution is
+alternating:
 
-Within one stick pair the element groups are dealt out alternately to the
-two sticks (even groups -> first stick, odd groups -> second stick):
+* **Even groups** ($G_0, G_2, \dots$) are stored in the first stick (`stick0`).
+* **Odd groups** ($G_1, G_3, \dots$) are stored in the second stick (`stick1`).
 
-  Host row, one stick pair = 64 columns = 16 element groups G0..G15:
+* **Element Group:** A set of 4 consecutive host elements. These groups always
+  stay together during conversion.
+* **Stick Pair:** Two adjacent device sticks that collectively hold the data
+  for 64 host columns (2 sticks $\times$ 32 elements).
 
-    col   0..3  4..7  8..11 12..15 16..19 20..23 ...  60..63
-        +-----+-----+-----+------+------+------+-----+------+
-  host  | G0  | G1  | G2  | G3   | G4   | G5   | ... | G15  |
-        +-----+-----+-----+------+------+------+-----+------+
+#### Visual Representation
 
-  Device, same stick pair, 2 sticks of 8 element groups (32 elements):
+Consider one host row spanning one stick pair (64 columns):
 
-    pos   0..3  4..7  8..11 12..15 16..19 20..23 24..27 28..31
-        +-----+-----+-----+------+------+------+------+------+
-  stick0| G0  | G2  | G4  | G6   | G8   | G10  | G12  | G14  |
-        +-----+-----+-----+------+------+------+------+------+
-  stick1| G1  | G3  | G5  | G7   | G9   | G11  | G13  | G15  |
-        +-----+-----+-----+------+------+------+------+------+
+**Host Logical Order:**
 
-  Reading D2H: walk the host row left to right; G0 comes from stick0
-  pos 0..3, G1 from stick1 pos 0..3, G2 from stick0 pos 4..7, and so on.
+```text
+Columns:  [ 0..3 ] [ 4..7 ] [ 8..11 ] [ 12..15 ] ... [ 60..63 ]
+Groups:   [  G0  ] [  G1  ] [  G2   ] [  G3   ] ... [  G15  ]
+```
 
-  i.e. host group G = 2 * group_in_stick + stick_in_pair.
+**Device Physical Storage (Same Stick Pair):**
 
-With more than one stick pair the pattern repeats: stick pair p covers host
-columns [64 *p, 64* p + 64) and device sticks 2p and 2p + 1.
+*Stick 0 (Even Groups)*
 
----------------------------------------------------------------------------
-1. The index mapping
----------------------------------------------------------------------------
-Every host column of a row decomposes uniquely as
+```text
+Pos:      [ 0..3 ] [ 4..7 ] [ 8..11 ] [ 12..15 ] ... [ 28..31 ]
+Groups:   [  G0  ] [  G2  ] [  G4   ] [  G6   ] ... [  G14  ]
+```
 
-  host_col = stick_pair     *64     (2 sticks* 32 elements)
-           + group_in_stick *8     (skip the other stick's group too)
-           + stick_in_pair*  4     (which of the two sticks)
-           + elem_in_group           (0..3)
+*Stick 1 (Odd Groups)*
 
-  stick_pair      in [0, num_sticks / 2)
-  group_in_stick  in [0, 8)
-  stick_in_pair   in [0, 2)
-  elem_in_group   in [0, 4)
+```text
+Pos:      [ 0..3 ] [ 4..7 ] [ 8..11 ] [ 12..15 ] ... [ 28..31 ]
+Groups:   [  G1  ] [  G3  ] [  G5   ] [  G7   ] ... [  G15  ]
+```
 
-and the same element lives on the device at
+To reconstruct the host row from the device, one must read $G_0$ from `stick0`
+pos 0..3, $G_1$ from `stick1` pos 0..3, $G_2$ from `stick0` pos 4..7, and so
+on.
 
-  device_stick    = 2 *stick_pair + stick_in_pair
-  device_position = group_in_stick* 4 + elem_in_group      (0..31)
+#### Index Mapping
 
----------------------------------------------------------------------------
-1. The strategy: split loops, do not move data
----------------------------------------------------------------------------
-A DataConversionStrideInfo (DCSI) is a loop nest, innermost loop first:
+To restore the standard arrangement, we map every host column to its specific
+location on the device. A host column index can be decomposed into four
+components:
 
-  for each index i_k in [0, size_[k]):
-    dst[sum_k i_k *stride_dst_[k]] = src[sum_k i_k* stride_src_[k]]
+$$
+\text{host\_col} = (\text{stick\_pair} \times 64) + (\text{group\_in\_stick} \times 8) + (\text{stick\_in\_pair} \times 4) + \text{elem\_in\_group}
+$$
 
-For D2H, src is the device buffer and dst is the host buffer.  The incoming
-DCSI assumes the device is in standard order: dimension 0 walks the
-32 elements of a stick, and one "stick dimension" walks successive sticks.
-That is wrong for a staggered layout.
+| Component | Range | Description |
+| :--- | :--- | :--- |
+| `stick_pair` | $[0, N/2)$ | Identifies the pair of sticks. |
+| `group_in_stick` | $[0, 8)$ | Identifies the group within a single stick. |
+| `stick_in_pair` | $[0, 2)$ | Identifies which of the two sticks in the pair. |
+| `elem_in_group` | $[0, 4)$ | Identifies the specific element within the group. |
 
-Instead of adding a shuffling pass we rewrite the loop nest so the same copy
-engine un-staggers while it copies.  Two of the original dimensions are each
-split into two smaller loops that have *different* src and dst strides:
+The corresponding device location is calculated as:
 
-original                  new loops (size, src step, dst step in elems)
----------------------------------------------------------------------------
-  dim 0 (32 elements)  ->   elem_in_group  : 4,   1 elem,    1 col
-                            group_in_stick : 8,   4 elems,   8 cols
+* **Device Stick:** $2 \times \text{stick\_pair} + \text{stick\_in\_pair}$
+* **Device Position:** $\text{group\_in\_stick} \times 4 + \text{elem\_in\_group}$
 
-  stick dim (N sticks) ->   stick_in_pair  : 2,   1 stick,    4 cols
-                            stick_pair     : N/2, 2 sticks,  64 cols
+#### Solution Approach 1: Split the DCSI loops
 
-  all other dims       ->   unchanged
+One way to restore the standard element arrangement during a D2H copy is by
+rewriting the copy loop nest by splitting the original dimensions into smaller
+loops with different source (device) and destination (host) strides.
 
-Read the table as "taking one step in this loop moves the device (src)
-pointer by X and the host (dst) pointer by Y".  For example group_in_stick
-advances 4 elements within a device stick but jumps 8 columns on the host,
-because the 4 columns in between belong to the other stick of the pair;
-stick_in_pair does the reverse, moving a whole device stick on the device
-but only 4 columns on the host.  The "stick pair" loop then moves two
-sticks / 64 columns at a time.  Strides are always expressed in multiples
-of the dimension-0 strides, so the element size does not matter.
+Loop Splitting Table:
 
-The stick dimension is identified by its HOST stride (one stick's worth of
-host columns), not by its device stride, because the device is free to
-order sticks differently (e.g. stick-major).
+| Original Dimension | New Loop | Size | Src Step (Device) | Dst Step (Host) | Logic |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Dim 0**<br>(32 elements) | `elem_in_group` | 4 | 1 elem | 1 col | Accesses individual elements. |
+| | `group_in_stick` | 8 | 4 elems | 8 cols | Skips the 4 columns belonging to the other stick. |
+| **Stick Dim**<br>(N sticks) | `stick_in_pair` | 2 | 1 stick | 4 cols | Switches between the two sticks in a pair. |
+| | `stick_pair` | $N/2$ | 2 sticks | 64 cols | Moves to the next pair of sticks. |
 
-Requirements (checked): full sticks only, and an even number of sticks along
-the stick dimension.
+How it works:
+
+1. **`group_in_stick` Loop:** Advancing this loop moves the device pointer by
+   4 elements (the size of one group) but jumps 8 columns on the host. This
+   jump accounts for the 4 columns of the current group plus the 4 columns of
+   the interleaved group from the other stick.
+2. **`stick_in_pair` Loop:** Advancing this loop moves the device pointer by
+   an entire stick (32 elements) but only advances 4 columns on the host. This
+   allows the copy engine to pick up the interleaved groups from the second
+   stick.
+3. **`stick_pair` Loop:** Advances both pointers by the full width of a stick
+   pair (64 columns / 2 sticks).
+
+ Constraints
+
+* **Full Sticks Only:** The restoration logic requires that sticks are fully
+  populated.
+* **Even Number of Sticks:** The stick dimension must have an even number of
+  sticks to form complete pairs.
+* **Host Stride Identification:** The stick dimension is identified by its
+  **HOST stride** (one stick's worth of host columns), not its device stride,
+  as the device may use different internal ordering (e.g., stick-major).
