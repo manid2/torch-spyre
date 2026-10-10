@@ -34,6 +34,8 @@ from utils_inductor import (
     cached_randn,
     shapes2key,
 )
+from torch_spyre._inductor.propagate_hints import spyre_hint
+from torch_spyre._inductor.wsr import propagate_named_dims as pnd
 
 
 def _dtype_name(dt):
@@ -557,72 +559,111 @@ def test_eager_ea(src_dev, dst_dev, fp16, eager_to):
 # D2H EA restore
 # ---------------------------------------------------------------------------
 def _build_ea_d2h_tests():
-    stick_aligned_shapes = [
-        # 1D: stick-aligned
+    # Shapes common to both conversions: the stick dim is a whole number of
+    # 64-element sticks.
+    STICK_ALIGNED_SHAPES = [
         (64,),
         (128,),
-        # 2D: stick-aligned
         (4, 64),
+        (4, 128),
         (7, 128),
-        # 3D: stick-aligned
         (2, 4, 64),
         (3, 5, 128),
         (4, 8, 128),
-        # 4D: stick-aligned
+        (8, 16, 64),
+        (8, 16, 128),
         (2, 3, 4, 64),
         (2, 3, 4, 128),
         (2, 4, 8, 64),
     ]
 
-    stick_unaligned_shapes = [
-        # 1D: non-stick-aligned
-        (44,),
+    # fp16 -> fp32 doubles the stick count, so the output is always whole stick
+    # pairs once the stick dim is at least 64 wide. Stick dims narrower than 64
+    # only get a single fp32 stick; these are rejected on D2H.
+    FP16_TO_FP32_SHAPES = STICK_ALIGNED_SHAPES + [
+        # Partial last stick or pair
         (68,),
-        # 2D: non-stick-aligned / padded
+        (4, 68),
+        (8, 16, 68),
+        (2, 96),
+        (4, 96),
+        (8, 16, 96),
+        (4, 100),
+        (8, 16, 100),
+        (4, 160),
+        (8, 16, 160),
+        # Narrower than one stick (rejected on D2H)
+        (44,),
         (4, 16),
         (4, 32),
-        (4, 68),
+        (4, 44),
         (7, 44),
-        # 3D: non-stick-aligned / padded
         (2, 4, 44),
-        # 4D: non-stick-aligned / padded
         (2, 3, 4, 44),
     ]
 
+    # fp32 -> fp16 halves the stick count, so the compiler only accepts an even
+    # number of 32-element fp32 sticks (rescale_stl_for_dtype). Shapes with an odd
+    # stick count (68, 96, 160 and 32 wide) are not supported.
+    FP32_TO_FP16_SHAPES = STICK_ALIGNED_SHAPES + [
+        # One stick + a partial stick
+        (4, 100),
+        (8, 16, 100),
+        # Single partial stick
+        (44,),
+        (4, 16),
+        (4, 44),
+        (7, 44),
+        (2, 4, 44),
+        (2, 3, 4, 44),
+    ]
+
+    EA = ElementArrangement
+    FP32 = torch.float32
     params = {}
-
-    for fp16 in DtypeOpTable.fp16_types():
-        conversions = [
-            (fp16, torch.float32, ElementArrangement.DL16_TO_FP32),
-            (torch.float32, fp16, ElementArrangement.FP32_TO_DL16),
+    for FP16 in DtypeOpTable.fp16_types():
+        tests = [
+            (FP16, FP32, EA.DL16_TO_FP32, FP16_TO_FP32_SHAPES),
+            (FP32, FP16, EA.FP32_TO_DL16, FP32_TO_FP16_SHAPES),
         ]
-
-        for src_dtype, dst_dtype, expected_ea in conversions:
+        for src_dtype, dst_dtype, expected_ea, shapes in tests:
             conv_name = f"{_dtype_name(src_dtype)}_to_{_dtype_name(dst_dtype)}"
-
-            # 1. Stick-aligned shapes (expected to pass)
-            for shape in stick_aligned_shapes:
+            for shape in shapes:
                 key = f"{conv_name}_{shapes2key((shape,))}"
                 params[key] = (src_dtype, dst_dtype, expected_ea, shape)
-
-            # 2. Non-stick-aligned shapes (marked as xfail)
-            for shape in stick_unaligned_shapes:
-                key = f"{conv_name}_{shapes2key((shape,))}"
-                params[key] = pytest.param(
-                    src_dtype,
-                    dst_dtype,
-                    expected_ea,
-                    shape,
-                    marks=pytest.mark.xfail(
-                        reason="D2H ea_restore requires full stick-aligned tensor dimensions",
-                        strict=True,
-                    ),
-                )
-
     return params
 
 
 EA_D2H_TEST_PARAMS = _build_ea_d2h_tests()
+
+
+def _d2h_unsupported(expected_ea, shape):
+    # fp16 -> fp32 restores whole fp32 stick pairs. A stick dim narrower than
+    # 64 only gets a single fp32 stick, so half of each pair has nowhere to go.
+    return expected_ea == ElementArrangement.DL16_TO_FP32 and shape[-1] < 64
+
+
+def _convert_one_row_per_core(x, dst_dtype):
+    """Convert on device with one M row per core.
+
+    Work division does not account for stick padding yet, so a single row per
+    core keeps the converted values correct for padded stick dims.
+    """
+    names = list("TBMN"[-x.dim() :])  # last dim is the stick dim N
+    torch._dynamo.reset()  # also clears declared dim names
+    for name, size in zip(names, x.shape):
+        pnd.declare_tensor_dim(name, size)
+    x_dev = x.to(DEVICE_NAME)
+    pnd.name_tensor_dims(x_dev, names)
+
+    def convert(a):
+        if a.dim() == 1:  # no M dim to divide
+            return a.to(dst_dtype)
+        with spyre_hint(work_div={"M": x.shape[-2]}):
+            return a.to(dst_dtype)
+
+    # static: a dynamic recompile is a different kernel
+    return torch.compile(convert, dynamic=False)(x_dev)
 
 
 @pytest.mark.parametrize(
@@ -631,22 +672,23 @@ EA_D2H_TEST_PARAMS = _build_ea_d2h_tests()
     ids=EA_D2H_TEST_PARAMS.keys(),
 )
 def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
-    # Small integer steps are exact in fp32, fp16 and bf16, so no rounding noise
+    # Small integers are exact in fp32, fp16 and bf16, so no rounding noise
     values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
-
-    x = values.to(src_dtype).to(DEVICE_NAME)
+    x = values.to(src_dtype)
     ref = values.to(dst_dtype)
 
-    y = _run(lambda a: a.to(dst_dtype), x)
+    y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
+
+    if _d2h_unsupported(expected_ea, shape):
+        with pytest.raises(RuntimeError, match="D2H requires whole stick pairs"):
+            y.cpu()  # D2H -> ea_restore
+        return
 
     got = y.cpu()  # D2H -> ea_restore
     assert got.dtype == ref.dtype
     assert got.shape == ref.shape
     assert torch.equal(got, ref)
-    assert torch.equal(
-        torch.sort(got.flatten()).values, torch.sort(ref.flatten()).values
-    )
 
 
 # Made with Bob
