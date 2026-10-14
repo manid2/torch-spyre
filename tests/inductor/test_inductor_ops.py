@@ -3387,12 +3387,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "int64_fp16_1d256": "Multi-arg pointwise with mixed EA",
                 "fp16_int64_1d256": "Multi-arg pointwise with mixed EA",
             },
-            # The compare is right on the device, but its staggered result is read
-            # back permuted with no error (#4393).
-            "expect_fail": {
-                "fp16_fp32_bcast_stick": "readback of the staggered mask is permuted, #4393",
-                "fp16_fp32_bcast_0dim": "readback of the staggered mask is permuted, #4393",
-            },
             "param_sets": {
                 # fp16 -> fp32 is stick-reordering: blocked by mixed EA
                 "fp16_fp32_1d256": (
