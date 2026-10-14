@@ -683,10 +683,10 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
 
     if _d2h_unsupported(expected_ea, shape):
         with pytest.raises(RuntimeError, match="D2H requires whole stick pairs"):
-            y.cpu()  # D2H -> ea_restore
+            y.cpu()  # D2H
         return
 
-    got = y.cpu()  # D2H -> ea_restore
+    got = y.cpu()  # D2H
     assert got.dtype == ref.dtype
     assert got.shape == ref.shape
     assert torch.equal(got, ref)
