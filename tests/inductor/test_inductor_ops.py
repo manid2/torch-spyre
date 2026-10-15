@@ -10320,11 +10320,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         y = cached_randn((64,), dtype=torch.float32)
         self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_host_to_fp32_cpu(self):
         # Literal repro from issue #1482: a host bool converted to fp32 and read
         # back directly, as a staggered float32 like any float16 source's.
@@ -10519,11 +10514,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = (torch.arange(128) % 7).to(torch.float16)
         self._assert_bool_to_int_on_device(fn, x)
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
     def test_bool_fp16_src_to_int64_readback_known_xfail(self):
         def fn(x):
             return (x > 2).to(dtype=torch.int64)
