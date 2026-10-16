@@ -468,7 +468,8 @@ _DEVICE_INTEGRAL_DTYPES = [
         marks=pytest.mark.xfail(
             strict=True,
             raises=RuntimeError,
-            reason="D2H requires whole stick pairs along the stick dimension",
+            reason="D2H requires whole stick pairs along the stick dimension; "
+            "bool promotion to fp32 produces a single partial stick (#5361)",
         ),
     ),
 ]

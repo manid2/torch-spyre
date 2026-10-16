@@ -521,6 +521,35 @@ TO_DTYPE_OP_PARAMS_SETS = {
     if src != torch.float8_e4m3fn
 }
 
+# fp16/bf16 -> fp32 with a padded stick dim (68 = one 64-element stick + 4): work
+# division does not account for the stick padding. The 68 columns count as 2 fp16
+# sticks and the default plan splits that stick dim over 2 cores per row
+# (work_slices={mb: 4, out: 2}). The staggered fp32 output is stored stick-major
+# (device_size=[4, 4, 32]), so one core's share is two separate rectangles; pass_utils
+# cannot place the split ("fused partitions are not one rectangle shape") but the
+# split is used anyway. 80 of 272 values come back wrong: columns 64-67 in every row,
+# and in rows 2 and 3 the second stick of the first pair is never written (reads 0).
+# It is exact with a one-row-per-core work_div hint or SENCORES=1, which is what
+# test_ea_restore_d2h uses, so the D2H restore itself is correct for this shape.
+# Same defect as #5361 ("(4, 68) is correct on one core and wrong on 32").
+_WORK_DIV_PADDING = (
+    "work division splits the padded stick dim of the staggered fp32 result over "
+    "cores into non-rectangular shares, so part of the result is never written "
+    "(#5361)"
+)
+
+_TO_DTYPE_WORK_DIV_FAIL_SHAPES = ("4x68",)
+TO_DTYPE_OP_WORK_DIV_FAIL = {
+    f"{src}_to_float32_{shape}"
+    for src in ("float16", "bfloat16")
+    for shape in _TO_DTYPE_WORK_DIV_FAIL_SHAPES
+}
+
+TO_DTYPE_OP_EXPECT_FAIL = {
+    **dict.fromkeys(TO_DTYPE_OP_WORK_DIV_FAIL, _WORK_DIV_PADDING),
+}
+
+
 # Conversions the device layout cannot be rescaled for. An fp32 stick holds 32
 # elements and an fp16/bf16 stick 64, so a dim of one or three fp32 sticks (the
 # 4x32, 4x68 and 68 shapes) is not a whole number of output sticks. The staggered
@@ -548,49 +577,9 @@ TO_DTYPE_OP_D2H_PAIR_REJECTED = {
     for shape in _D2H_PAIR_REJECTED_SHAPES
 }
 
-# fp16/bf16 -> fp32 with a padded stick dim (68 = one 64-element stick + 4):
-# work division does not account for stick padding yet, so the device conversion
-# itself leaves wrong values for the default work division. The D2H restore is
-# correct for this shape (see test_ea_restore_d2h, which uses a one-row-per-core
-# work_div hint).
-TO_DTYPE_OP_WORK_DIV_PADDING = {
-    "float16_to_float32_4x68",
-    "bfloat16_to_float32_4x68",
-}
-
-TO_DTYPE_OP_EXPECT_FAIL = TO_DTYPE_OP_WORK_DIV_PADDING
-
 TO_DTYPE_OP_EXPECT_RAISE = {
     **dict.fromkeys(TO_DTYPE_OP_D2H_PAIR_REJECTED, _D2H_PAIR_REJECTION),
     **dict.fromkeys(TO_DTYPE_OP_RESCALE_REJECTED, _RESCALE_REJECTION),
-}
-
-# The cases left in TO_DTYPE_OP_EXPECT_FAIL return the cast result straight to the
-# host, and the result is wrong on 27-88% of its elements. The values on the device
-# are correct; the readback is not. A cast between fp16/bf16 and fp32 leaves a
-# staggered element arrangement, and the device-to-host copy reads it as STANDARD,
-# so the elements come back permuted with no error (#4393). In 30 of the 34 cases
-# converting the result back on the device restores the input exactly, which shows
-# the values are right; the other four cannot be checked that way, because the
-# conversion back is itself rejected (4x32: "cannot rescale device layout") or hits
-# the partial-stick limit (4x68).
-_STAGGERED_READBACK = "readback of the staggered cast result is permuted, #4393"
-_STAGGERED_READBACK_UNCHECKED = (
-    "readback of the staggered cast result is wrong, probably #4393 "
-    "(the values cannot be checked on the device for this shape)"
-)
-_STAGGERED_READBACK_UNCHECKED_CASES = {
-    f"{src}_to_float32_{shape}"
-    for src in ("float16", "bfloat16")
-    for shape in ("4x32", "4x68")
-}
-TO_DTYPE_OP_EXPECT_FAIL = {
-    case: (
-        _STAGGERED_READBACK_UNCHECKED
-        if case in _STAGGERED_READBACK_UNCHECKED_CASES
-        else _STAGGERED_READBACK
-    )
-    for case in TO_DTYPE_OP_EXPECT_FAIL
 }
 
 TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS = {
