@@ -54,6 +54,18 @@ _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
     "and the test asserts no warning (#5364)",
 )
 
+# bool + 2.0 converts the bool to a staggered (DL16_TO_FP32) float32 on the device.
+# A 0-dim or sub-pair stick dim is not padded to a whole stick pair, because
+# rescale_stl_for_dtype only doubles a stick-count dim whose stride is the input
+# stick depth (#5361). The D2H restore now raises instead of returning values that
+# were only right by accident on main (n <= 4).
+_SCALAR_ADD_XFAIL_BOOL_STAGGERED = pytest.mark.xfail(
+    strict=True,
+    raises=RuntimeError,
+    reason="the float32 result is staggered but its stick dim is not padded to a "
+    "whole stick pair, so the D2H restore raises (#5361)",
+)
+
 
 def _expect_raise(match):
     """Decorator: the test passes only if it raises with a message matching ``match``."""
@@ -623,6 +635,7 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.bool, lambda: torch.tensor(True, dtype=torch.bool), None),
                 name="bool",
+                decorators=[_SCALAR_ADD_XFAIL_BOOL_STAGGERED],
             ),
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
