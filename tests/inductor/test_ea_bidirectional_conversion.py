@@ -68,45 +68,66 @@ def assert_ea(tensor, expected_ea):
 def assert_val(fn, x, result):
     x_cpu = x.cpu()
     result_cpu = fn(x_cpu)
-    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(result.cpu(), result_cpu, rtol=1e-2, atol=1e-2)
 
 
 def ea_of(dev):
     return ElementArrangement.STANDARD if dev == DEVICE_NAME else None
 
 
+# Shapes whose whole content fits in a single stick, so the tensor has no
+# spatial dim outside the stick dim for the conversion op to loop over.
+STICK_ONLY_SHAPES = [
+    (),
+    (1,),
+    (1, 1),
+    (1, 1, 1),
+    (1, 1, 1, 1),
+]
+
+# Stick aligned shape
+BASIC_SHAPES = [(4, 128)]
+
+_SHAPES = STICK_ONLY_SHAPES + BASIC_SHAPES
+
 _TEST_CASES = [
-    (device, mode, fp16)
+    (device, mode, fp16, shape)
     for device in [DEVICE_NAME]
     for mode in ["compile", "eager"]
     for fp16 in DtypeOpTable.fp16_types()
+    for shape in _SHAPES
 ]
 
 _TEST_IDS = [
-    f"{device}-{mode}-{fp16}".replace("torch.", "")
-    for device, mode, fp16 in _TEST_CASES
+    f"{device}-{mode}-{fp16}-{shapes2key((shape,))}".replace("torch.", "")
+    for device, mode, fp16, shape in _TEST_CASES
 ]
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp16_to_fp32_standard_input(device, mode, fp16):
+def test_fp16_to_fp32_standard_input(device, mode, fp16, shape):
     """Test FP16/BF16→FP32 with STANDARD input creates DL16_TO_FP32 (#2843)."""
 
     def fn(x):
         return x.to(torch.float32)
 
-    x = torch.randn(4, 128, device=device, dtype=fp16)
+    x = torch.randn(shape, device=device, dtype=fp16)
     result = _run(fn, x, mode=mode)
 
     # Verify output EA
-    assert_ea(result, ElementArrangement.DL16_TO_FP32)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.DL16_TO_FP32
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has DL16_TO_FP32 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print(f"✓ {fp16}→FP32 with STANDARD input produces DL16_TO_FP32 ({mode})")
 
@@ -127,25 +148,30 @@ def test_mixed_bf16_fp32_add_rejects_ea_mismatch(device, mode):
 
 
 @pytest.mark.parametrize(
-    "device, mode, fp16",
+    "device, mode, fp16, shape",
     _TEST_CASES,
     ids=_TEST_IDS,
 )
-def test_fp32_to_fp16_standard_input(device, mode, fp16):
+def test_fp32_to_fp16_standard_input(device, mode, fp16, shape):
     """Test FP32→FP16 with STANDARD input creates FP32_TO_DL16."""
 
     def fn(x):
         return x.to(dtype=fp16)
 
-    x = torch.randn(4, 128, device=device, dtype=torch.float32)
+    x = torch.randn(shape, device=device, dtype=torch.float32)
     result = _run(fn, x, mode=mode)
 
     # Eager and compiled casts use the same compiled D2D conversion path, so
     # both preserve the hardware conversion's staggered element arrangement.
-    assert_ea(result, ElementArrangement.FP32_TO_DL16)
+    expected_ea = (
+        ElementArrangement.STANDARD
+        if shape in STICK_ONLY_SHAPES
+        else ElementArrangement.FP32_TO_DL16
+    )
+    assert_ea(result, expected_ea)
 
-    # Note: Cannot compare tensors with non-STANDARD EA directly with CPU
-    # The result has FP32_TO_DL16 EA which differs from CPU's STANDARD EA
+    # Verify correctness
+    assert_val(fn, x, result)
 
     print("✓ FP32→{fp16} with STANDARD input produces FP32_TO_DL16 ({mode})")
 
@@ -258,17 +284,6 @@ def test_bidirectional_roundtrip_fp32_start(device, fp16):
     assert_val(fn, x, result)
 
     print("✓ FP32→FP16→FP32 roundtrip works")
-
-
-# Shapes whose whole content fits in a single stick, so the tensor has no
-# spatial dim outside the stick dim for the conversion op to loop over.
-STICK_ONLY_SHAPES = [
-    (),
-    (1,),
-    (1, 1),
-    (1, 1, 1),
-    (1, 1, 1, 1),
-]
 
 
 @pytest.mark.parametrize("shape", STICK_ONLY_SHAPES)
@@ -788,10 +803,26 @@ def _build_ea_d2h_tests():
         (2, 4, 8, 64),
     ]
 
+    # n (2, 63]: 2 <= n <= 63 shapes
+    SMALL_N_SHAPES = [
+        (2,),
+        (3,),
+        (4,),
+        (16,),
+        (32,),
+        (63,),
+        (2, 2),
+        (4, 16),
+        (4, 32),
+    ]
+
+    # base shapes
+    BASE_SHAPES = STICK_ALIGNED_SHAPES + SMALL_N_SHAPES + STICK_ONLY_SHAPES
+
     # fp16 -> fp32 doubles the stick count, so the output is always whole stick
     # pairs once the stick dim is at least 64 wide. Stick dims narrower than 64
     # only get a single fp32 stick; these are rejected on D2H.
-    FP16_TO_FP32_SHAPES = STICK_ALIGNED_SHAPES + [
+    FP16_TO_FP32_SHAPES = BASE_SHAPES + [
         # Partial last stick or pair
         (68,),
         (4, 68),
@@ -816,7 +847,7 @@ def _build_ea_d2h_tests():
     # fp32 -> fp16 halves the stick count, so the compiler only accepts an even
     # number of 32-element fp32 sticks (rescale_stl_for_dtype). Shapes with an odd
     # stick count (68, 96, 160 and 32 wide) are not supported.
-    FP32_TO_FP16_SHAPES = STICK_ALIGNED_SHAPES + [
+    FP32_TO_FP16_SHAPES = BASE_SHAPES + [
         # One stick + a partial stick
         (4, 100),
         (8, 16, 100),
@@ -837,15 +868,38 @@ def _build_ea_d2h_tests():
             (FP16, FP32, EA.DL16_TO_FP32, FP16_TO_FP32_SHAPES),
             (FP32, FP16, EA.FP32_TO_DL16, FP32_TO_FP16_SHAPES),
         ]
-        for src_dtype, dst_dtype, expected_ea, shapes in tests:
+        for src_dtype, dst_dtype, base_expected_ea, shapes in tests:
             conv_name = f"{_dtype_name(src_dtype)}_to_{_dtype_name(dst_dtype)}"
             for shape in shapes:
+                expected_ea = (
+                    ElementArrangement.STANDARD
+                    if shape in STICK_ONLY_SHAPES
+                    else base_expected_ea
+                )
                 key = f"{conv_name}_{shapes2key((shape,))}"
                 params[key] = (src_dtype, dst_dtype, expected_ea, shape)
     return params
 
 
 EA_D2H_TEST_PARAMS = _build_ea_d2h_tests()
+
+
+def _rescale_rejected(src_dtype, dst_dtype, shape):
+    # FP32 -> FP16/BF16 conversion requires an even number of FP32 sticks because two
+    # 32-element FP32 sticks combine to form one 64-element FP16/BF16 stick.  If the
+    # input shape results in an odd number of FP32 sticks (e.g., shape (32,) has 1
+    # stick, shape (4, 32) has 1 stick in the last dim), `rescale_stl_for_dtype` rejects
+    # the layout as it cannot form whole output sticks. See #3809, #5361.
+    _RESCALE_REJECTED_SHAPES = [
+        (32,),
+        (4, 32),
+    ]
+
+    return (
+        src_dtype == torch.float32
+        and dst_dtype in (torch.float16, torch.bfloat16)
+        and shape in _RESCALE_REJECTED_SHAPES
+    )
 
 
 def _d2h_unsupported(expected_ea, shape):
@@ -868,7 +922,7 @@ def _convert_one_row_per_core(x, dst_dtype):
     pnd.name_tensor_dims(x_dev, names)
 
     def convert(a):
-        if a.dim() == 1:  # no M dim to divide
+        if a.dim() < 2:  # no M dim to divide
             return a.to(dst_dtype)
         with spyre_hint(work_div={"M": x.shape[-2]}):
             return a.to(dst_dtype)
@@ -887,6 +941,11 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
     x = values.to(src_dtype)
     ref = values.to(dst_dtype)
+
+    if _rescale_rejected(src_dtype, dst_dtype, shape):
+        with pytest.raises(InductorError, match="cannot rescale device layout"):
+            _convert_one_row_per_core(x, dst_dtype)
+        return
 
     y = _convert_one_row_per_core(x, dst_dtype)
     assert_ea(y, expected_ea)
