@@ -627,6 +627,20 @@ def _single_arg_op_layout(
 
             fmt = DtypeOpTable.ea_map(ea_src_dtype, output.dtype, input_ea)
 
+            # Force STANDARD for 0-dim and 1-element tensors where staggering is
+            # meaningless or invalid for D2H restore. See #5361.
+            if fmt in (
+                ElementArrangement.DL16_TO_FP32,
+                ElementArrangement.FP32_TO_DL16,
+            ):
+                num_elems = 1
+                for s in in_layout.size:
+                    num_elems *= concretize_expr(s)
+
+                # 0-dim (num_elems=1) and 1-element tensors cannot form stick pairs
+                if num_elems <= 1:
+                    fmt = ElementArrangement.STANDARD
+
             # Two strategies, chosen by whether a staggered EA is involved:
             #
             # 1. Staggered conversions (RMSNorm up/down-cast and their
@@ -689,7 +703,10 @@ def _single_arg_op_layout(
             # stick dim is unaligned, force a full input-stick depth so stick
             # padding is reflected in the device layout (see #1756 example above).
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
+            if (
+                len(in_layout.size) > 0
+                and concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0
+            ):
                 c_size = [concretize_expr(s) for s in output.size[:-1]] + [
                     in_elems_per_stick
                 ]
