@@ -782,7 +782,7 @@ def test_pad_of_staggered_inside_stick_pair_raises():
 
 
 # ---------------------------------------------------------------------------
-# D2H EA restore
+# D2H EA restore, H2D write back
 # ---------------------------------------------------------------------------
 def _build_ea_d2h_tests():
     # Shapes common to both conversions: the stick dim is a whole number of
@@ -959,6 +959,124 @@ def test_ea_restore_d2h(src_dtype, dst_dtype, expected_ea, shape):
     assert got.dtype == ref.dtype
     assert got.shape == ref.shape
     assert torch.equal(got, ref)
+
+
+EA_H2D_TEST_PARAMS = EA_D2H_TEST_PARAMS
+
+EA_H2D_BASIC_TEST_PARAMS = {
+    key: params for key, params in EA_H2D_TEST_PARAMS.items() if params[3] in _SHAPES
+}
+
+
+def _make_x_and_new(shape, src_dtype, dst_dtype, offset=100.0):
+    """Small integers, exact in fp16, bf16 and fp32, for reproducible compares.
+
+    bf16 only represents integers exactly up to 256, so the offset keeps
+    values + offset + 1 under that. A +1000 offset would round in bf16.
+    """
+    values = torch.ceil(cached_randn(shape, dtype=torch.float32) * 5)
+    x = values.to(src_dtype)  # source data on host
+    new = (values + offset).to(dst_dtype)  # data to be H2D-copied
+    return x, new
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_TEST_PARAMS.values(),
+    ids=EA_H2D_TEST_PARAMS.keys(),
+)
+def test_ea_restore_h2d(src_dtype, dst_dtype, expected_ea, shape):
+    x, new = _make_x_and_new(shape, src_dtype, dst_dtype)
+
+    if _rescale_rejected(src_dtype, dst_dtype, shape):
+        with pytest.raises(InductorError, match="cannot rescale device layout"):
+            _convert_one_row_per_core(x, dst_dtype)
+        return
+
+    # Create staggered tensor on device
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    if _d2h_unsupported(expected_ea, shape):
+        # ea_restore now runs for H2D too and applies the same whole-stick-pair
+        # check as D2H, so the copy_ itself is rejected.
+        with pytest.raises(RuntimeError, match="requires whole stick pairs"):
+            y.copy_(new)
+        return
+
+    # H2D `copy_` of new (STANDARD host data) into the staggered y.
+    # The EA tag is unchanged, copy_ writes only the data.
+    y.copy_(new)
+    assert_ea(y, expected_ea)
+
+    # D2H restore must now produce exactly `new`.
+    got = y.cpu()
+    assert got.dtype == new.dtype
+    assert got.shape == new.shape
+    assert torch.equal(got, new), (
+        f"{shape} {src_dtype}->{dst_dtype}: H2D copy_ into staggered tensor "
+        f"mismatch ({(got != new).sum().item()}/{new.numel()} wrong)"
+    )
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_BASIC_TEST_PARAMS.values(),
+    ids=EA_H2D_BASIC_TEST_PARAMS.keys(),
+)
+def test_ea_restore_h2d_compiled_consumer(src_dtype, dst_dtype, expected_ea, shape):
+    x, new = _make_x_and_new(shape, src_dtype, dst_dtype)
+
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    # H2D copy into the staggered buffer.
+    y.copy_(new)
+
+    # Compiled consumer: (y + 1).to(src_dtype). Reading y through a kernel
+    # verifies that the data on the device really is in staggered order.
+    def consume(a):
+        return (a + 1.0).to(src_dtype)
+
+    torch._dynamo.reset()
+    z = torch.compile(consume, dynamic=False)(y)
+    got = z.cpu()
+
+    # `new` is already dst_dtype, so add 1 in dst_dtype like the device does.
+    expected = (new + 1.0).to(src_dtype)
+    assert torch.equal(got, expected), (
+        f"{shape} {src_dtype}->{dst_dtype}: compiled consumer after H2D "
+        f"mismatch ({(got != expected).sum().item()}/{expected.numel()} wrong)"
+    )
+
+
+@pytest.mark.parametrize(
+    "src_dtype, dst_dtype, expected_ea, shape",
+    EA_H2D_BASIC_TEST_PARAMS.values(),
+    ids=EA_H2D_BASIC_TEST_PARAMS.keys(),
+)
+def test_ea_h2d_d2h_h2d_chain(src_dtype, dst_dtype, expected_ea, shape):
+    x, new1 = _make_x_and_new(shape, src_dtype, dst_dtype, offset=100.0)
+    _, new2 = _make_x_and_new(shape, src_dtype, dst_dtype, offset=50.0)
+    assert not torch.equal(new1, new2)  # distinct payloads
+
+    y = _convert_one_row_per_core(x, dst_dtype)
+    assert_ea(y, expected_ea)
+
+    # H2D #1 -> D2H
+    y.copy_(new1)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new1), f"{shape}: chain read1 mismatch"
+
+    # H2D #2 (same staggered tensor, different data) -> D2H
+    y.copy_(new2)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new2), f"{shape}: chain read2 mismatch"
+
+    # A third round, back to the first payload, so it can't be a one-shot fluke.
+    y.copy_(new1)
+    assert_ea(y, expected_ea)
+    assert torch.equal(y.cpu(), new1), f"{shape}: chain read3 mismatch"
 
 
 # Made with Bob

@@ -424,9 +424,8 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
   const int host_rank = strides.size();
   const int device_rank = stl.stride_map.size();
 
-  // D2H copies of staggered layouts need their element arrangement restored.
-  const bool restore_ea =
-      !host2device && is_ea_staggered(stl.element_arrangement);
+  // D2H restores the EA staggered into STANDARD, H2D writes it back.
+  const bool restore_ea = is_ea_staggered(stl.element_arrangement);
 
   // Stick tiling facts for ea_restore. The innermost device dim holds the
   // elements of a stick, the host dim tiled into it is the stick dim, and the
@@ -669,8 +668,19 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
       is_stick_tail[i] = ((i >> stick_remainder) & 1) != 0;
     }
 
+    // ea_restore treats src as the device and dst as the host. The rewrite
+    // only permutes loops, so an H2D copy swaps the two around it.
+    auto ea_swap_src_dst = [&]() {
+      if (!host2device) return;
+      for (auto& info : stride_infos) {
+        std::swap(info.stride_src_, info.stride_dst_);
+        std::swap(info.offset_src_, info.offset_dst_);
+      }
+    };
+    ea_swap_src_dst();
     ea_restore(stride_infos, stl, stick_host_extent, stick_count_dim,
                allocated_sticks, is_stick_tail);
+    ea_swap_src_dst();
   }
 
   return stride_infos;
