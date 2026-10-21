@@ -69,6 +69,7 @@ from .constants import (
     ELIDED_COPY_BACK_ATTR,
     REDUCTIONS_NON_STICK_DIM_ONLY,
     STAGGERED_EAS,
+    SUPPORTED_EAS,
 )
 from .ir import (
     AllGatherAsyncFallback,
@@ -723,6 +724,35 @@ def _single_arg_op_layout(
                     c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
                 )
             ]
+
+        case spyreop.shuffle.default:
+            # Read dst_ea from the stashed attribute on the buffer data
+            # (set by lower_spyre_shuffle).
+            dst_ea_int = getattr(op.data, "ea_shuffle_dst_ea", None)
+
+            if dst_ea_int is None:
+                raise Unsupported("shuffle: missing ea_shuffle_dst_ea on buffer")
+
+            # Convert int back to ElementArrangement enum
+            try:
+                dst_ea = next(
+                    member
+                    for member in ElementArrangement.__members__.values()
+                    if member.value == dst_ea_int
+                )
+            except ValueError:
+                raise Unsupported(f"shuffle: invalid ea value {dst_ea_int}")
+
+            # Preserve the full device geometry (device_size, stride_map) and
+            # only change the element_arrangement tag.
+            out_stl = SpyreTensorLayout(
+                stl.device_size,
+                stl.stride_map,
+                stl.device_dtype,
+                dst_ea,
+            )
+            op.restick_cost_fn = AnyInNode.from_args()
+            return [out_stl]
 
         case spyreop.qfp8ch.default:
             # fp16 (64 elems/stick) -> fp8 (128 elems/stick) quantization.
@@ -1712,24 +1742,30 @@ def _multi_arg_pointwise_layouts(
             # represent yet (future: insert an explicit EA conversion at extra
             # cost). Report the offending STANDARD operand (there is always one
             # here, since 3.1 failed).
-            arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
-            stl = arg.layouts[0]
-            c_stride = [concretize_expr(s) for s in arg.layout.stride]
-            mapped = next(
-                (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
-                None,
-            )
-            mapped_size = (
-                concretize_expr(arg.layout.size[mapped])
-                if mapped is not None
-                else "unknown"
-            )
-            raise Unsupported(
-                f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
-                f"must broadcast (device stick dimension size 1) to be compatible "
-                f"with a staggered EA, and no staggered operand is broadcastable "
-                f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
-            )
+
+            # Check if all staggered operands are in the supported list
+            stag_eas = [arg.layouts[0].element_arrangement for arg, _, _ in stag_split]
+            if stag_eas and all(ea in SUPPORTED_EAS for ea in stag_eas):
+                output_ea = ElementArrangement.STANDARD
+            else:
+                arg = next(arg for arg, broadcast, _ in std_split if not broadcast)
+                stl = arg.layouts[0]
+                c_stride = [concretize_expr(s) for s in arg.layout.stride]
+                mapped = next(
+                    (d for d, hs in enumerate(c_stride) if hs == stl.stride_map[-1]),
+                    None,
+                )
+                mapped_size = (
+                    concretize_expr(arg.layout.size[mapped])
+                    if mapped is not None
+                    else "unknown"
+                )
+                raise Unsupported(
+                    f"Multi-arg pointwise with mixed EA: STANDARD input {arg.dep.name} "
+                    f"must broadcast (device stick dimension size 1) to be compatible "
+                    f"with a staggered EA, and no staggered operand is broadcastable "
+                    f"either. Its stick maps to host dim {mapped} of size {mapped_size}"
+                )
     else:
         # Case 1: all STANDARD (or non-staggered) EAs - use STANDARD.
         output_ea = ElementArrangement.STANDARD
