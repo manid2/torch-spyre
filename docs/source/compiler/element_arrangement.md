@@ -489,3 +489,258 @@ device values are correct for padded shapes. The shape lists are:
 
 fp32 to fp16 shapes that the compiler rejects (see the compile-time
 restriction above) are not part of this test.
+
+Shuffle op
+---
+
+The `spyre::shuffle` custom op is a compiler primitive that **applies or
+restores** a staggered element arrangement on a tensor **within the
+compilation graph**, on the device, without changing its dtype or logical
+shape.
+
+### Motivation
+
+Without `shuffle`, an op whose operands carry **different** EAs is illegal
+currently raises `Unsupported` exception, and a staggered tensor can only get
+back to STANDARD order by being reverse type conversion.
+
+Two consequences:
+
+* A staggered FP32 tensor cannot be combined with a non-staggered FP32 tensor.
+* Every upcast or downcast has to be bracketed by ops that do not care about
+  element position, and extra restickifications and pads were needed around
+  them (for example in the MoE implementation).
+
+`shuffle` removes both restrictions. It lets the compiler fix arrangement
+incompatibilities by adding or removing the staggered arrangement that the
+hardware introduces on upcast and downcast.
+
+The staggered arrangements are the same wherever the conversion happens: the
+arrangement made by an fp32 to fp16 downcast is the same one whether it is
+around a softmax or next to any other op, and likewise for the arrangement made
+by an upcast. `shuffle` can be used to apply and to undo exactly these
+arrangements.
+
+Together with the element precision, three kinds of arrangement
+(STANDARD, upcast stagger, downcast stagger) are enough to know how the
+elements of a tensor are arranged.
+
+### Use cases
+
+#### Ops supported without `shuffle`
+
+EA propagates forward through the graph. A multi-arg pointwise op is a join
+point, where the output EA is decided from the EAs of the operands (the table
+uses "broadcast" for an operand whose stick holds at most one distinct host
+element, for example a size-1 stick dim or a scalar):
+
+| Op | Operand EAs | Output EA | Today |
+| :--- | :--- | :--- | :--- |
+| Unary pointwise (`exp`, `neg`, `sigmoid`, ...) | one EA, any | same as input | Supported |
+| Multi-arg pointwise (`add`, `sub`, `mul`, `where`, ...) | all STANDARD | STANDARD | Supported |
+| Multi-arg pointwise | all the same staggered EA | that staggered EA | Supported |
+| Multi-arg pointwise | one staggered EA + STANDARD operands that all broadcast | the staggered EA | Supported |
+| Multi-arg pointwise | one staggered EA that all broadcasts + STANDARD full operands | STANDARD | Supported |
+| Multi-arg pointwise | index operand read only at lane 0 of each stick | ignored for the EA decision | Supported, because the stagger keeps lane 0 in place |
+| Full reduction over the stick dim (`sum`, `max`, `mean`, ...) | staggered | STANDARD | Supported, because the order does not matter |
+| Multi-arg pointwise | two different staggered EAs | - | `Unsupported` |
+| Multi-arg pointwise | a staggered full operand + a STANDARD full operand | - | `Unsupported` |
+| Layernorm ops carrying `EXX2` | `EXX2` | - | Handled by dedicated layouts, not part of this table |
+
+Ops that are not in the FP32 allowlist (`SPYRE_FP32_OPS`) are `Unsupported` for
+FP32 inputs whatever the EA is, and `shuffle` does not change that.
+
+#### Ops supported with `shuffle`
+
+The `Unsupported` case of a full staggered operand mixed with a full STANDARD
+operand has one cause: the op would pair elements by slot, and the slots of the
+two operands hold different logical elements. Giving both operands the same
+arrangement turns the op into one of the supported rows. Only the full operands
+need a shuffle, since a broadcast operand already works with any arrangement.
+
+The other `Unsupported` row, two different staggered EAs, is not listed here.
+Each staggered EA belongs to one dtype (`DL16_TO_FP32` is the arrangement of an
+fp32 tensor made by an upcast, `FP32_TO_DL16` of a 16-bit tensor made by a
+downcast), so operands of the same dtype cannot carry both.
+
+| Case | Operands | Fix with `shuffle` | Result EA |
+| :--- | :--- | :--- | :--- |
+| Staggered full + STANDARD full | `x` is `DL16_TO_FP32`, `y` is STANDARD (fp32) | shuffle `y` to `DL16_TO_FP32`, or shuffle `x` to STANDARD | `DL16_TO_FP32`, or STANDARD |
+| Staggered full + STANDARD full | `x` is `FP32_TO_DL16`, `y` is STANDARD (fp16) | shuffle `y` to `FP32_TO_DL16`, or shuffle `x` to STANDARD | `FP32_TO_DL16`, or STANDARD |
+| Ops that read element position | a staggered tensor feeds an op that needs sequential order, if the op is allowed in that dtype | shuffle the tensor to STANDARD first | STANDARD |
+| Persisting FP32 | an upcast result should be stored or returned as FP32 | shuffle to STANDARD after the upcast | STANDARD |
+
+Which direction to pick is a cost decision. The shuffle goes on the operand that
+is cheaper to move, and the target is the arrangement that the rest of the graph
+wants. If a downcast follows (which undoes the stagger for free), prefer to keep
+the chain staggered.
+
+#### Use case walkthroughs
+
+**Mixed-precision binary op.** Take an FP32 ADD where input A is a
+non-staggered fp16 tensor and input B is a non-staggered fp32 tensor. Before
+`shuffle` this could not be compiled: A is staggered once it is upcast, B is
+STANDARD, and both are full operands. Now there are two options:
+
+```text
+Option 1: leave the result in fp32 (good if the user wants fp32, or if more
+          fp32 ops follow)
+
+  A fp16 -> upcast -> A fp32 (staggered) -> shuffle -> A fp32 (STANDARD)
+  B fp32 (STANDARD)
+  fp32 ADD(A, B) -> result fp32 (STANDARD)
+
+Option 2: stay staggered and come back to fp16 (good if more fp16 ops follow)
+
+  A fp16 -> upcast -> A fp32 (staggered)
+  B fp32 (STANDARD) -> shuffle -> B fp32 (staggered)
+  fp32 ADD(A, B) -> result fp32 (staggered) -> downcast -> result fp16 (STANDARD)
+```
+
+In option 2 the downcast undoes the stagger for free, so only B pays for a
+shuffle. Pick the option that needs the fewest rearranged tensors.
+
+**Two staggered operands that differ.** `x` came from an upcast
+(`DL16_TO_FP32`) and `y` was staggered to prepare for a downcast
+(`FP32_TO_DL16`). `mul(x, y)` is `Unsupported`. Shuffling `y` to
+`DL16_TO_FP32` makes both operands identical, and the output is
+`DL16_TO_FP32`.
+
+**Already supported, no shuffle needed.** A staggered activation multiplied by
+a per-row scale whose stick dim has size 1 (a broadcast) works as is and stays
+staggered. A STANDARD activation multiplied by a staggered per-row scale also
+works, and the output is STANDARD. A `sum` over the stick dim of a staggered
+tensor works and gives STANDARD.
+
+**Undo a stagger without narrowing.** Shuffling `fp32(DL16_TO_FP32)` to
+`fp32(STANDARD)` makes a standard FP32 tensor out of an upcast result. This
+also gives standard FP32 for eager `.to(fp32)`.
+
+**Prepare for a later conversion.** Applying the staggered arrangement that a
+later downcast or upcast expects lets a tensor that was produced in STANDARD
+order take part in a staggered flow.
+
+**Fewer restickifications and pads.** An arrangement mismatch no longer has to
+be avoided by restickifying or padding. This is relevant for the MoE
+implementation.
+
+**Debugging.** A staggered tensor can be inspected by shuffling it to STANDARD
+on the device and copying that to the host.
+
+### Examples
+
+The four shuffle cases:
+
+```text
+# Restore STANDARD
+Case 1  fp32(DL16_TO_FP32)  --shuffle-->  fp32(STANDARD)
+        undo stagger after an upcast         (2-byte source elements)
+
+Case 2  fp16(FP32_TO_DL16)  --shuffle-->  fp16(STANDARD)
+        undo stagger after a downcast        (4-byte source elements)
+
+# Apply STAGGER
+Case 3  fp32(STANDARD)      --shuffle-->  fp32(DL16_TO_FP32)
+        apply downcast stagger               (prepares for a later downcast)
+
+Case 4  fp16(STANDARD)      --shuffle-->  fp16(FP32_TO_DL16)
+        apply upcast stagger                 (prepares for a later upcast)
+```
+
+Data flow for case 1 to avoid mixed EA error in binary op e.g. `torch.add`:
+
+```text
+x_fp16[2, 64]
+    |
+    v  dl16tofp32
+x_fp32[2, 64]  (EA = DL16_TO_FP32, staggered)
+    |
+    v  shuffle(dst_arrangement = STANDARD)
+x_fp32[2, 64]  (EA = STANDARD, sequential)
+    |
+    v  add(x_fp32_standard, bias_fp32_standard)   <- no mixed-EA error
+result_fp32[2, 64]
+```
+
+### Design
+
+**Front end (torch-spyre).** `shuffle` is Spyre custom op that takes a
+tensor and the target arrangement. On CPU it is a plain clone, because
+arrangement is a device-internal concept. When lowered, it becomes an identity
+pointwise op that carries the target arrangement. Layout propagation gives its
+output the same layout as its input with the new arrangement. Code generation
+emits it as a `shuffle` op in which the input and the output layouts differ only
+in their element arrangement. The absence of an arrangement on a side means
+STANDARD.
+
+**Backend.** `shuffle` is an alias of `identity`, a data-movement op that only
+moves elements around. Before, `identity` could only permute whole 128 Byte
+sticks, because the input and the output shared one slice and one stick layout.
+They can now differ. When the two sides hold the elements of a stick in a
+different order:
+
+* The innermost loop band is split into one band per piece that the two
+  arrangements ask for.
+* The innermost datastage is forced to a single access per piece. The existing
+  shrink turns that access into a 16 Byte or 2 Byte splat load and a masked
+  store.
+* The permutation lives entirely in the two addresses (the source and the
+  destination offset). The data copy itself is unchanged.
+
+The arrangements are read to the end of the dimension, not to the end of a
+stick. A reshuffle that moves elements between sticks (such as `DL16_TO_FP32`,
+which spreads the groups of one 16-bit stick over two FP32 sticks) is handled
+the same way as one inside a single stick. A pair of arrangements that differs
+only in the order of the sticks moves a whole stick per access. The size of an
+access is still decided from one stick, which is as far as the order between
+dimensions is known and as much as one access can move anyway.
+
+**Why this design.**
+
+* The permutation is an address computation, so it reuses the existing
+  `identity` data path and needs no new compute kernel.
+* The layout does not change, only the arrangement tag does. Modelling
+  the op as an identity with a different output EA keeps the existing layout
+  propagation and cost model valid.
+* An explicit op keeps the cost decision visible. A shuffle costs bandwidth, so
+  the choice to spend it is made by whoever places the op, and not hidden inside
+  another op.
+* The same op covers all four cases, in both directions, and the arrangement is
+  the same regardless of the surrounding op or precision.
+
+**Alternatives in the front-end compiler.**
+
+* *Automatic insertion.* Instead of an explicit op, a pass could insert shuffles
+  wherever `is_ea_compatible` fails, choosing which operand to rearrange from a
+  cost estimate. This is the natural next step. It can be built on top of the
+  op, and the op is still needed as the primitive it inserts.
+* *Host-side restore only.* The D2H restore is cheap on the device, but it
+  cannot help with ops that combine operands on the device, and it does not
+  allow a standard FP32 tensor to persist in HBM.
+
+### Limitations
+
+* **Supported granularity:** the pieces have to hold whole elements and be an
+  access size that the load and store units can move. A permutation at a
+  granularity the hardware does not support is refused, and so is an
+  arrangement that would put one element in two places. The arrangements
+  produced by fp16 to fp32 upcasts and fp32 to fp16 downcasts are within these
+  limits in both directions.
+* **Cost:** a shuffle is a data copy with small accesses, so it costs memory
+  bandwidth and time, and a non-shuffled tensor is always cheaper. Per stick:
+  | Element size | Access size | Accesses per stick (load + store) |
+  | :--- | :--- | :--- |
+  | FP32 (4 B) | 16 B | 8 + 8 |
+  | 16-bit (2 B) | 2 B | 64 + 64 |
+  Whole-stick moves (only the stick order differs) take one access per stick.
+  Prefer the ephemeral bracket (the downcast restores STANDARD for free) when
+  it fits, and use `shuffle` where it does not.
+* **Visibility:** a staggered tensor must never be visible to the user. Nothing
+  outside the compiler should interpret one. A staggered tensor may be an
+  intermediate tensor, even if it spills to HBM, but it must be shuffled to
+  STANDARD (or downcast) before it is moved to the host.
+* **Scope of arrangements:** only the staggered arrangements made by 16-bit to
+  FP32 conversions are covered. Other arrangements (`EXX2`, FP8 quantization
+  outputs) are out of scope. Going through more than one conversion (for
+  example fp32 to fp16 to fp8) would need the number of conversions to be
+  tracked as well.
