@@ -2198,6 +2198,18 @@ def compute_layouts(
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
 
+    if aten_op == spyreop.shuffle.default or any(
+        origin.target == spyreop.shuffle.default for origin in data.origins
+    ):
+        layouts = []
+        for stl in args[0].layouts:
+            result = _single_arg_op_layout(
+                op, output, output_dep, args[0].dep, args[0].layout, stl
+            )
+            layouts.extend(result)
+        op.restick_cost_fn = AnyInNode.from_args()
+        return layouts
+
     # All other single arg ops
     layouts = []
     for stl in args[0].layouts:

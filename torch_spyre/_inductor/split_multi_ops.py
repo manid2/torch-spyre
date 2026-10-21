@@ -40,6 +40,8 @@ from .pass_utils import (
     find_fx_node,
 )
 from .constants import is_ea_compatible, SUPPORTED_EAS
+from .optimize_restickify import AllSameNode, AnyInNode
+from .propagate_layouts import _get_prop_args
 from .provenance import decompose_provenance
 from torch_spyre._C import SpyreTensorLayout, ElementArrangement
 from torch_spyre.constants import DEVICE_NAME
@@ -792,6 +794,17 @@ def _insert_shuffle_op(
 
     object.__setattr__(new_buf, "origins", OrderedSet([shuffle_node]))
 
+    # Set layouts on new_buf
+    stg_stl = next(iter(stg_buf.layouts))
+    out_stl = SpyreTensorLayout(
+        stg_stl.device_size,
+        stg_stl.stride_map,
+        stg_stl.device_dtype,
+        target_ea,
+    )
+    new_buf.layouts = [out_stl]
+    new_buf.restick_cost_fn = AnyInNode.from_args()
+
     # Update provenance
     decompose_provenance(
         stg_buf,
@@ -821,6 +834,15 @@ def _insert_shuffle_op(
         reason="insert EA shuffle redirect",
     )
     graph.name_to_buffer[new_op.get_name()] = new_op
+
+    if hasattr(op, "layouts"):
+        new_op.layouts = list(op.layouts)
+        rw = new_op.get_read_writes()
+        output_dep = next(iter(rw.writes))
+        args = _get_prop_args(rw.reads)
+        new_op.restick_cost_fn = AllSameNode.from_args(
+            args, new_op.layouts, output_dep, new_op
+        )
 
     logger.info(f"Successfully inserted shuffle: {stg_name} -> {new_buf.get_name()}")
     return True
