@@ -12804,12 +12804,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     "fp32toint32", fn, x.to(src), dsts=(torch.int32, torch.int64)
                 )
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_float16_to_int_readback_known_xfail(self):
+    def test_float16_to_int_readback(self):
         def fn(x):
             return x.to(dtype=torch.int32)
 
@@ -12833,12 +12828,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     values = x if dst == torch.float16 else x // 8 * 8
                     self._assert_conversion_on_device("fp32todl16", fn, values.to(src))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AssertionError,
-        reason="a staggered result is read back without restoring its order (#4393)",
-    )
-    def test_int_to_float16_readback_known_xfail(self):
+    def test_int_to_float16_readback(self):
         def fn(x):
             return x.to(torch.float16)
 
