@@ -1512,7 +1512,7 @@ def lower_spyre_shuffle(src, ea):
     # device without altering its dtype or logical shape. Create a Pointwise
     # that is an identity copy of src — same dtype and shape — but materialises
     # as a distinct ComputedBuffer. The origin_node keeps the FX-level
-    # spyre.ea_shuffle node alive in data.origins so propagate_layouts can
+    # spyre.shuffle node alive in data.origins so propagate_layouts can
     # identify it and read ea from the node's args.
     src.realize()
     loader = src.make_loader()

@@ -376,17 +376,16 @@ def _(src: torch.Tensor, dtype: torch.dtype, src_off: int) -> torch.Tensor:
     return torch.empty_like(src, dtype=dtype)
 
 
-# Element-arrangement shuffle: moves elements within sticks to change the
-# ElementArrangement of a tensor without changing its dtype or logical shape.
-# The four cases (deeptools PR #4651):
+# `shuffle`: moves elements within sticks to change the ElementArrangement of a
+# tensor without changing its dtype or logical shape.
+#
+# The four cases:
 #   1. fp32 DL16_TO_FP32  → fp32 STANDARD  : undo upcast stagger (2B source)
 #   2. fp16 FP32_TO_DL16  → fp16 STANDARD  : undo downcast stagger (4B source)
 #   3. fp32 STANDARD      → fp32 FP32_TO_DL16 : apply downcast stagger
 #   4. fp16 STANDARD      → fp16 DL16_TO_FP32 : apply upcast stagger
 #
 # ``ea`` is the integer value of the target ElementArrangement.
-# On CPU (eager) this is a no-op — element arrangement is a device-internal
-# bookkeeping property; the logical values are identical to the input.
 @torch.library.custom_op("spyre::shuffle", mutates_args=(), device_types="spyre")
 def shuffle(src: torch.Tensor, ea: int) -> torch.Tensor:
     pass
