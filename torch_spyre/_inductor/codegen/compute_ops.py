@@ -1259,6 +1259,12 @@ def generate_sdsc(
             result[f"[{c}, 0, 0]"] = str(local_symbols[key])
         return result
 
+    # `shuffle` is also the opfunc of restickify; only a shuffle with a staggered
+    # side re-arranges the elements of a stick.
+    is_ea_shuffle = sdsc_spec.opfunc == "shuffle" and any(
+        a.element_arrangement in STAGGERED_EAS for a in sdsc_spec.args
+    )
+
     def _build_coord_info(op, tensor, tensor_idx: int) -> dict:
         """Builds the coordinate information for all dimensions of a tensor.
 
@@ -1281,11 +1287,6 @@ def generate_sdsc(
         dim_order = _filter_window_dims(layout["dim_order"], tensor.layout)
         stick_dim_order = layout["stick_dim_order"]
         is_input = tensor_idx < sdsc_spec.num_inputs
-        # `shuffle` is also the opfunc of restickify; only a shuffle with a
-        # staggered side re-arranges the elements of a stick.
-        is_ea_shuffle = sdsc_spec.opfunc == "shuffle" and any(
-            a.element_arrangement in STAGGERED_EAS for a in sdsc_spec.args
-        )
         result = {}
         for dim in dim_order:
             dim_str = str(dim)
@@ -1708,6 +1709,7 @@ def generate_sdsc(
                                                 or int(core) in active_core_ids
                                             }
                                             if sdsc_spec.opfunc == "shuffle"
+                                            and not is_ea_shuffle
                                             and tensor.work_division is not None
                                             else {}
                                         ),
