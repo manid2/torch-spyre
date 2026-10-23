@@ -185,7 +185,7 @@ auto replace_dim(DataConversionStrideInfo info, size_t dim,
 }
 
 /**
- * Restore STANDARD element arrangement for a DL16_TO_FP32 D2H copy.
+ * Restore STANDARD element arrangement for a DL16_TO_FP32 host-device copy.
  *
  * The device stores each pair of fp32 sticks (64 host columns) staggered:
  * element `unit * 4 + i` of stick `s` in the pair holds host column
@@ -207,7 +207,7 @@ void ea_restore_fp16tofp32(std::vector<DataConversionStrideInfo>& restored,
                            size_t stick_count_dim, int64_t elems_per_group,
                            int64_t sticks_per_pair) {
   TORCH_CHECK(dcsi.size_[0] == elems_per_stick,
-              "DL16_TO_FP32 D2H requires full sticks (", elems_per_stick,
+              "DL16_TO_FP32 EA restore requires full sticks (", elems_per_stick,
               " elements), got a partial stick of ", dcsi.size_[0]);
 
   const int64_t device_elem_stride = dcsi.stride_src_[0];
@@ -216,6 +216,13 @@ void ea_restore_fp16tofp32(std::vector<DataConversionStrideInfo>& restored,
   const int64_t pair_columns = sticks_per_pair * elems_per_stick;
   const int64_t unit_columns = sticks_per_pair * elems_per_group;
   const int64_t units_per_pair = elems_per_stick / elems_per_group;
+
+  TORCH_CHECK(
+      dcsi.stride_dst_[stick_count_dim] == elems_per_stick * host_elem_stride,
+      "DL16_TO_FP32 EA restore: host stick stride ",
+      dcsi.stride_dst_[stick_count_dim],
+      " does not match a contiguous stick dim (expected ",
+      elems_per_stick * host_elem_stride, ")");
 
   // Restores `elems` elements x `units` units x `sticks` sticks x `pairs`
   // pairs, whose first host column is `first_column`.
@@ -260,7 +267,7 @@ void ea_restore_fp16tofp32(std::vector<DataConversionStrideInfo>& restored,
 }
 
 /**
- * Restore STANDARD element arrangement for an FP32_TO_DL16 D2H copy.
+ * Restore STANDARD element arrangement for an FP32_TO_DL16 host-device copy.
  *
  * One device stick holds the same host columns as in standard order, so each
  * DCSI (whole stick or partial last stick) is restored on its own: device
@@ -280,7 +287,7 @@ void ea_restore_fp32tofp16(std::vector<DataConversionStrideInfo>& restored,
                            int64_t halves_per_stick) {
   const int64_t columns = dcsi.size_[0];
   TORCH_CHECK(columns > 0 && columns <= elems_per_stick,
-              "FP32_TO_DL16 D2H: unexpected stick extent ", columns,
+              "FP32_TO_DL16 EA restore: unexpected stick extent ", columns,
               " for stick size ", elems_per_stick);
 
   const int64_t device_elem_stride = dcsi.stride_src_[0];
@@ -333,7 +340,7 @@ auto is_ea_staggered(const ElementArrangement ea) {
 
 /**
  * Restore STANDARD element arrangement for DL16_TO_FP32 / FP32_TO_DL16 device
- * layouts by rewriting the DCSIs of a D2H copy.
+ * layouts by rewriting the DCSIs of a host-device copy.
  *
  * @param dcsis DCSIs from get_device_stride_infos; replaced by the restored
  *              DCSIs (their number can change).
@@ -379,12 +386,18 @@ void ea_restore(std::vector<DataConversionStrideInfo>& dcsis,
     const int64_t pair_columns = kSticksPerPair * elems_per_stick;
     const int64_t sticks_needed =
         (stick_host_extent + pair_columns - 1) / pair_columns * kSticksPerPair;
-    TORCH_CHECK(stick_count_dim > 0 && allocated_sticks >= sticks_needed &&
-                    allocated_sticks % kSticksPerPair == 0,
-                "DL16_TO_FP32 D2H requires whole stick pairs along the stick "
-                "dimension: ",
-                stick_host_extent, " elements need ", sticks_needed,
-                " sticks, but ", allocated_sticks, " are allocated");
+    TORCH_CHECK(stick_count_dim >= 0, "DL16_TO_FP32 EA restore: stick dim of ",
+                stick_host_extent,
+                " elements is narrower than one stick pair (", pair_columns,
+                " = 2 x ", elems_per_stick,
+                " elements) and cannot be restored");
+    TORCH_CHECK(
+        stick_count_dim > 0 && allocated_sticks >= sticks_needed &&
+            allocated_sticks % kSticksPerPair == 0,
+        "DL16_TO_FP32 EA restore requires whole stick pairs along the stick "
+        "dimension: ",
+        stick_host_extent, " elements need ", sticks_needed, " sticks, but ",
+        allocated_sticks, " are allocated");
 
     for (size_t i = 0; i < dcsis.size(); i++) {
       // The partial-stick remainder is regenerated from the host extent.
@@ -653,7 +666,7 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     TORCH_CHECK(stl.element_arrangement != ElementArrangement::DL16_TO_FP32 ||
                     (stick_host_dim >= 0 && !stick_ambiguous),
                 "Unable to determine the stick dimension for DL16_TO_FP32 "
-                "D2H");
+                "EA restore");
 
     // DCSIs are stored innermost first, i.e. in reversed device order.
     const int64_t stick_count_dim =

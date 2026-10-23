@@ -14,17 +14,22 @@ But due to requirements to support new models there is a need to restore
 or apply different element arrangements on Spyre. This document describes the
 element arrangement and its awareness through the model compilation graph.
 
-Restore EA D2H
+Restore EA
 ---
 
-Restore STANDARD element arrangement in a D2H copy of a tensor whose
+Restore STANDARD element arrangement in a D2H or H2D copy of a tensor whose
 SpyreTensorLayout has a staggered element arrangement
 (`DL16_TO_FP32` or `FP32_TO_DL16`).
 
 The restore does not move any data on the device. It rewrites the data
-conversion stride info (DCSI) of the copy so that the existing D2H copy engine
-reads every staggered element from its device location and writes it to its
-standard host column.
+conversion stride info (DCSI) of the copy so that the existing copy engine
+reads every staggered element from its source location and writes it to its
+standard destination column.
+
+* **D2H:** The device holds staggered data; the DCSI is rewritten so the host
+  receives a STANDARD element arrangement.
+* **H2D:** The host holds STANDARD data; the DCSI is rewritten so the device
+  receives the staggered element arrangement.
 
 ### How the DCSIs are rewritten
 
@@ -142,9 +147,9 @@ To restore the standard arrangement, we map every host column to its specific
 location on the device. A host column index can be decomposed into four
 components:
 
-$$
-\text{host\_col} = (\text{stick\_pair} \times 64) + (\text{group\_in\_stick} \times 8) + (\text{stick\_in\_pair} \times 4) + \text{elem\_in\_group}
-$$
+```
+host_col = (stick_pair * 64) + (group_in_stick * 8) + (stick_in_pair * 4) + elem_in_group
+```
 
 | Component | Range | Description |
 | :--- | :--- | :--- |
@@ -155,8 +160,8 @@ $$
 
 The corresponding device location is calculated as:
 
-* **Device Stick:** $2 \times \text{stick\_pair} + \text{stick\_in\_pair}$
-* **Device Position:** $\text{group\_in\_stick} \times 4 + \text{elem\_in\_group}$
+* **Device Stick:** `2 * stick_pair + stick_in_pair`
+* **Device Position:** `group_in_stick * 4 + elem_in_group`
 
 #### Solution: split the DCSI loops pair by pair
 
@@ -171,7 +176,7 @@ Loop Splitting Table:
 | **Dim 0**<br>(32 elements) | `elem_in_group` | 4 | 1 elem | 1 col | Accesses individual elements. |
 | | `group_in_stick` | 8 | 4 elems | 8 cols | Skips the 4 columns belonging to the other stick. |
 | **Stick-count dim**<br>(N sticks) | `stick_in_pair` | 2 | 1 stick | 4 cols | Switches between the two sticks in a pair. |
-| | `stick_pair` | $N/2$ | 2 sticks | 64 cols | Moves to the next pair of sticks. |
+| | `stick_pair` | N/2 | 2 sticks | 64 cols | Moves to the next pair of sticks. |
 
 How it works:
 
@@ -326,9 +331,9 @@ pos 8..11, ..., $G_7$ from pos 56..59, then $G_8$ from pos 4..7, and so on.
 
 A host column index within a stick is decomposed into three components:
 
-$$
-\text{host\_col} = (\text{stick} \times 64) + (\text{half\_in\_stick} \times 32) + (\text{group\_in\_half} \times 4) + \text{elem\_in\_group}
-$$
+```
+host_col = (stick * 64) + (half_in_stick * 32) + (group_in_half * 4) + elem_in_group
+```
 
 | Component | Range | Description |
 | :--- | :--- | :--- |
@@ -339,8 +344,8 @@ $$
 
 The corresponding device location is calculated as:
 
-* **Device Stick:** $\text{stick}$
-* **Device Position:** $\text{group\_in\_half} \times 8 + \text{half\_in\_stick} \times 4 + \text{elem\_in\_group}$
+* **Device Stick:** stick
+* **Device Position:** group_in_half *8 + half_in_stick* 4 + elem_in_group
 
 #### Solution: split the DCSI loops
 

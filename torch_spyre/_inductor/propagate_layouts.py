@@ -656,7 +656,14 @@ def _single_arg_op_layout(
                 for s in in_layout.size:
                     num_elems *= concretize_expr(s)
 
-                # 0-dim (num_elems=1) and 1-element tensors cannot form stick pairs
+                # Fallback to STANDARD only for num_elems <= 1.
+                # - Scalars/0-dim tensors lack a stick dimension to interleave, making
+                #   STANDARD exact.
+                # - Shapes with 1 < num_elems < pair_columns are deliberately
+                #   kept staggered.
+                # - These small shapes are expected to fail loudly at copy time
+                #   ("requires whole stick pairs").
+                # - Forcing STANDARD broadly would change layout strategy
                 if num_elems <= 1:
                     fmt = ElementArrangement.STANDARD
 
