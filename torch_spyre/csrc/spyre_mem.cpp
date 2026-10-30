@@ -1290,6 +1290,10 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   const at::Tensor* copy_from = &self;
   const at::Tensor* copy_to = &dst;
   bool non_overlapping_and_dense = true;
+  // Strides to use when building the final cpu_alloc → dst view in the staging
+  // path. Defaults to self.strides(); overridden by case (d) to use the padded
+  // row strides of the EA staging buffer.
+  std::vector<int64_t> staging_view_strides;
 
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
@@ -1306,12 +1310,29 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     //   (b) the tensor is sliced along a tiled dimension, starts in the middle
     //       of a tile, and goes beyond the tile it starts in.
     //   (c) the tensor is sliced along a dimension not in the stride_map.
+    //   (d) the tensor has a staggered EA (DL16_TO_FP32 or FP32_TO_DL16) and
+    //       the EA permutation covers a padded stick extent larger than the
+    //       logical stick dim. The host buffer for the DMA must be large enough
+    //       for the full padded extent; a separate as_strided view then selects
+    //       the valid elements for the final copy.
     if (self.is_privateuseone()) {
       auto* spyre_impl =
           static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
       const bool expanded = std::ranges::any_of(
           self.strides(), [](const int64_t& stride) { return stride < 1; });
       const int64_t dma_numel = c10::multiply_integers(spyre_impl->dma_sizes);
+      const auto& stl = spyre_impl->spyre_layout;
+      // Case (d): staggered EA with padded stick dim.
+      // device_size = [..., stick_count, elems_per_stick]. The EA permutation
+      // covers stick_count * elems_per_stick elements on the stick (host)
+      // dimension. When that padded extent exceeds the logical stick dim the
+      // host buffer must be widened to avoid an out-of-bounds write.
+      const bool ea_padded =
+          !self.sizes().empty() && is_ea_staggered(stl.element_arrangement) &&
+          stl.device_size.size() >= 2 &&
+          stl.device_size[stl.device_size.size() - 2] *
+                  stl.device_size[stl.device_size.size() - 1] >
+              self.sizes().back();
       if (expanded || dma_numel < self.numel()) {
         non_overlapping_and_dense = false;
         c10::IntArrayRef alloc_sizes(spyre_impl->dma_sizes);
@@ -1321,6 +1342,31 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
         cpu_alloc = at::empty(alloc_sizes, dst.options());
         copy_from = &alloc_view;
         copy_to = &cpu_alloc;
+      } else if (ea_padded) {
+        // Case (d): staggered EA with padded stick dim. Build a staging buffer
+        // that covers the full EA permutation extent on the stick dimension,
+        // then let as_strided select only the valid elements for the final
+        // copy.
+        non_overlapping_and_dense = false;
+        const int64_t eps = stl.device_size.back();
+        const int64_t padded_sticks =
+            stl.device_size[stl.device_size.size() - 2];
+        const int64_t padded_dim = padded_sticks * eps;
+        std::vector<int64_t> padded_sizes = self.sizes().vec();
+        padded_sizes.back() = padded_dim;
+        std::vector<int64_t> padded_strides(padded_sizes.size());
+        padded_strides.back() = 1;
+        for (int i = static_cast<int>(padded_sizes.size()) - 2; i >= 0; --i) {
+          padded_strides[i] = padded_strides[i + 1] * padded_sizes[i + 1];
+        }
+        alloc_view = at::as_strided(self, padded_sizes, padded_strides,
+                                    /*storage_offset=*/0);
+        cpu_alloc = at::empty(padded_sizes, dst.options());
+        copy_from = &alloc_view;
+        copy_to = &cpu_alloc;
+        // The staging buffer has padded row strides; use them in the final view
+        // so as_strided reads the valid column slice at the correct offsets.
+        staging_view_strides = std::move(padded_strides);
       } else if (dma_numel > self.numel()) {
         auto stl = spyre_impl->spyre_layout;
         const std::vector<std::vector<int>> tile_map =
@@ -1411,8 +1457,16 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 
   if (!non_overlapping_and_dense) {
-    at::Tensor cpu_view = cpu_alloc.as_strided(self.sizes(), self.strides(),
-                                               self.storage_offset());
+    // For case (d) (staggered EA with padded stick dim), staging_view_strides
+    // holds the contiguous strides of the padded staging buffer; use those so
+    // the as_strided view reads the valid column slice at the right row
+    // offsets. For all other cases staging_view_strides is empty and
+    // self.strides() apply.
+    const std::vector<int64_t> view_strides = staging_view_strides.empty()
+                                                  ? self.strides().vec()
+                                                  : staging_view_strides;
+    at::Tensor cpu_view =
+        cpu_alloc.as_strided(self.sizes(), view_strides, self.storage_offset());
     dst.copy_(cpu_view);
   }
   return dst;
