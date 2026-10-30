@@ -194,8 +194,8 @@ void ea_shuffle_fp32tofp16(int64_t elems_per_stick, int64_t sticks,
                            std::vector<int64_t>& sub_stride) {
   const int64_t groups_per_half =
       elems_per_stick / elems_per_group / halves_per_stick;
-  sub_elems = {elems_per_group, halves_per_stick, groups_per_half, sticks};
-  sub_stride = {1, elems_per_group, halves_per_stick * elems_per_group,
+  sub_elems = {elems_per_group, groups_per_half, halves_per_stick, sticks};
+  sub_stride = {1, halves_per_stick * elems_per_group, elems_per_group,
                 elems_per_stick};
 }
 
