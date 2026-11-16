@@ -81,7 +81,12 @@ def _has_indirect_access(op, indirect_names) -> bool:
 
 
 def _committed_layout(graph: GraphLowering, name: str) -> FixedTiledLayout | None:
-    layout = graph.get_buffer(name).get_layout()
+    buf = graph.try_get_buffer(name)
+    if buf is None:
+        buf = graph.graph_inputs.get(name)
+    if buf is None:
+        return None
+    layout = buf.get_layout()
     if isinstance(layout, MutationLayoutSHOULDREMOVE):
         layout = layout.real_layout()
     return layout if isinstance(layout, FixedTiledLayout) else None

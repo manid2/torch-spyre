@@ -821,15 +821,19 @@ TO_DTYPE_OP_EXPECT_FAIL = [
 
 # Unstaggering fp16 to fp32 EA requires whole FP32 stick pairs. The copy round trip is
 # rejected at compile time when a core gets an odd number of FP32 sticks: 1 for 4x16.
+# TODO: convert to positive test when partial stick pair support lands
 _WHOLE_STICK_PAIRS = "requires whole FP32 stick pairs"
-WHOLE_STICK_PAIRS_REJECTIED = {
+WHOLE_STICK_PAIRS_REJECTED = {
     "bfloat16_to_float32_4x16",
     "float16_to_float32_4x16",
 }
 
-# dbo-opt (sbf-ddc) rejects the shuffle kernel of this shape
-_BACKEND_ERROR = "Cannot find a valid minimum value for data stage"
-BACKEND_ERROR_REJECTIED = {
+# dbo-opt (sbf-ddc) rejects the shuffle kernel of wide shapes (#5361)
+_BACKEND_ERROR = (
+    "dbo-opt (sbf-ddc) rejects the shuffle kernel: Cannot find a valid minimum "
+    "value for data stage (#5361)"
+)
+BACKEND_ERROR_CASES = {
     "bfloat16_to_float32_5120",
     "float16_to_float32_5120",
 }
@@ -1000,9 +1004,10 @@ def _round_trip_pair_reasons(cases):
 TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL = _round_trip_pair_reasons(
     TO_DTYPE_OP_ROUND_TRIP_ADD_EXPECT_FAIL
 )
-TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = _round_trip_pair_reasons(
-    TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL
-)
+TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL = {
+    **_round_trip_pair_reasons(TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL),
+    **dict.fromkeys(BACKEND_ERROR_CASES, _BACKEND_ERROR),
+}
 TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL = _round_trip_pair_reasons(
     TO_DTYPE_OP_ROUND_TRIP_IMPLICIT_EXPECT_FAIL
 )
@@ -8253,8 +8258,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_COPY_EXPECT_FAIL,
             "expect_raise": {
                 **dict.fromkeys(ROUND_TRIP_RESCALE_REJECTED, _RESCALE_REJECTION),
-                **dict.fromkeys(WHOLE_STICK_PAIRS_REJECTIED, _WHOLE_STICK_PAIRS),
-                **dict.fromkeys(BACKEND_ERROR_REJECTIED, _BACKEND_ERROR),
+                **dict.fromkeys(WHOLE_STICK_PAIRS_REJECTED, _WHOLE_STICK_PAIRS),
             },
         },
         (
@@ -13049,7 +13053,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         def fn(d, s):
             d.copy_(s)
-            return d.to(s.dtype)
+            return d.to(s.dtype), d
 
         self.compare_with_cpu(
             fn,

@@ -38,9 +38,11 @@ from utils_inductor import shapes2key, expects_raise
 EA = ElementArrangement
 
 
-def _run(fn, *args, mode="compile"):
+def _run(fn, *args, mode="compile", reset_dynamo=False):
     if mode == "compile":
-        fn = torch.compile(fn)
+        if reset_dynamo:
+            torch._dynamo.reset()
+        fn = torch.compile(fn, dynamic=False)
     return fn(*args)
 
 
@@ -745,12 +747,20 @@ class TestEAShuffle:
     # Odd number (>= 3) of fp32 stick pairs per row: dbo-opt fails on the shuffle
     # kernel when a core gets few rows (even pair counts are exact, and so are
     # (64, 320) and wider with 64 rows; (64, 192) depends on the test order).
-    _ODD_PAIR_SHAPES = [(1, 192), (4, 160), (4, 192), (4, 320), (4, 448)]
+    _ODD_PAIR_SHAPES = [
+        (1, 192),
+        (4, 160),
+        (4, 192),
+        (4, 320),
+        (4, 448),
+        (64, 192),
+        (64, 448),
+    ]
     # Rows so long that the LX planner puts the shuffle's input and output in
     # different memories, one in LX and one in HBM: dbo-opt fails too. With
     # ``LX_PLANNING=0`` they compile and are exact, as are narrower rows (both
     # sides in LX) and more rows per core (both sides in HBM, as (64, 151936)).
-    _WIDE_SHAPES = [(2, 128256)]
+    _WIDE_SHAPES = [(2, 128256), (64, 151936)]
     _BACKEND_FAILURES = dict.fromkeys(_ODD_PAIR_SHAPES + _WIDE_SHAPES, _BACKEND_ERROR)
 
     # Shapes the compiler rejects today, with a fragment of the error. They are
@@ -758,16 +768,11 @@ class TestEAShuffle:
     # test_ea_shuffle_rejected.
     _DL16_TO_FP32_REJECTED = {
         # fewer than a whole pair of 32-element fp32 sticks
+        # TODO: convert to positive test when partial stick pair support lands
         **dict.fromkeys([(2,), (32,), (4, 16), (4, 32)], _WHOLE_STICK_PAIRS),
-        # a rank >= 3 read of the shuffled stick dim is not affine
-        (2, 4, 64): _NOT_DIVISIBLE,
-        (2, 3, 4, 64): _NOT_DIVISIBLE,
         **dict.fromkeys(_ODD_PAIR_SHAPES, _BACKEND_ERROR),
     }
-    _FP32_TO_DL16_REJECTED = {
-        # one 32-element fp32 stick is not a whole 64-element fp16 stick
-        **dict.fromkeys([(32,), (4, 32)], _RESCALE_REJECTION),
-    }
+    _FP32_TO_DL16_REJECTED: dict[tuple[int, ...], str] = {}
     _DIRECTIONS = [
         (EA.DL16_TO_FP32, "dl16_to_fp32", _DL16_TO_FP32_SHAPES, _DL16_TO_FP32_REJECTED),
         (EA.FP32_TO_DL16, "fp32_to_dl16", _FP32_TO_DL16_SHAPES, _FP32_TO_DL16_REJECTED),
@@ -821,8 +826,6 @@ class TestEAShuffle:
         (256,),
         (512,),
         (1, 256),
-        (64, 448),
-        (64, 151936),
     ]
     _MIXED_EA_REJECTED = {(2, 32): _WHOLE_STICK_PAIRS, **_BACKEND_FAILURES}
 
@@ -843,10 +846,12 @@ class TestEAShuffle:
         y = _small_int_fp16(shape, 5, base=3).to(y_dtype)
         return x, y
 
-    def _check(self, fn, shape, fp16, ea=EA.DL16_TO_FP32):
+    def _check(self, fn, shape, fp16, ea=EA.DL16_TO_FP32, reset_dynamo=False):
         """Run ``fn(x, y)`` compiled on the device; it must equal the CPU result."""
         x, y = self._operands(ea, shape, fp16)
-        result = _run(fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME))
+        result = _run(
+            fn, x.to(DEVICE_NAME), y.to(DEVICE_NAME), reset_dynamo=reset_dynamo
+        )
         assert_ea(result, EA.STANDARD)
         assert_val(fn, (x, y), result)
 
@@ -878,14 +883,14 @@ class TestEAShuffle:
     )
     def test_shuffle_pointwise(self, ea, fp16, pointwise):
         """Each pointwise op, and chains of them, read a shuffled operand."""
-        self._check(self._cast_then(pointwise), (2, 64), fp16, ea)
+        self._check(self._cast_then(pointwise), (2, 64), fp16, ea, reset_dynamo=True)
 
     @_FP16
     @pytest.mark.parametrize("shape", _MIXED_EA_SHAPES, ids=lambda s: shapes2key((s,)))
     @pytest.mark.parametrize("program", list(MIXED_EA_PROGRAMS))
     def test_mixed_ea_pointwise(self, program, shape, fp16):
         """A pointwise op on a staggered and a STANDARD operand matches the CPU."""
-        self._check(self.MIXED_EA_PROGRAMS[program], shape, fp16)
+        self._check(self.MIXED_EA_PROGRAMS[program], shape, fp16, reset_dynamo=True)
 
     @expects_raise
     @_FP16
@@ -899,7 +904,12 @@ class TestEAShuffle:
     def test_mixed_ea_pointwise_rejected(self, shape, match, fp16):
         """A staggered fp32 operand the compiler cannot shuffle fails cleanly."""
         with pytest.raises((InductorError, BackendCompilerFailed), match=match):
-            self._check(self.MIXED_EA_PROGRAMS["upcast_plus_std32"], shape, fp16)
+            self._check(
+                self.MIXED_EA_PROGRAMS["upcast_plus_std32"],
+                shape,
+                fp16,
+                reset_dynamo=True,
+            )
 
 
 # Made with Bob

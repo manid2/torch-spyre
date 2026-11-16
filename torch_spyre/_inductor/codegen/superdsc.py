@@ -1638,7 +1638,7 @@ def _create_sdsc_tensors(
                     stick_size = arg.device_dtype.elems_per_stick()
                     dev_dim_size *= stick_size
                     it_dim_size = ((it_dim_size - 1) // stick_size + 1) * stick_size
-            if dim is stick_dim:
+            if dim == stick_dim:
                 stick_device_size = dev_dim_size
 
             if has_indirect_access:
