@@ -105,6 +105,7 @@ from .pass_utils import (
     sparse_stl_from_host,
     sparse_target_for_unservable_read,
 )
+from .loop_node import all_ops as _all_loop_ops
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import compute_coordinates, matching_dim
 
@@ -3831,6 +3832,126 @@ def propagate_spyre_tensor_layouts(
             logger.warning(f"unhandled operation type {type(op)}")
 
     _resolve_copy_back_candidates(operations)
+    _promote_loop_mutation_target_eas(operations)
+
+
+def _promote_loop_mutation_target_eas(operations: list["Operation"]) -> None:
+    """Promote a no-op allocation's EA when loop-body mutation writers have staggered EA.
+
+    ``_fresh_allocation_layout`` runs before the loop-body ops are laid out, so it
+    cannot see a staggered EA from a writer that lives inside a ``LoopNode`` body.
+    After the main propagation loop all body ops have their ``layouts`` set; this pass
+    makes a second scan to pick up those deferred arrangements and upgrades the outer
+    allocation's ``layouts[0]`` to match, so ``finalize_layouts`` bakes the correct
+    ``element_arrangement`` into the buffer's ``FixedTiledLayout``.
+
+    Any top-level op that directly reads a promoted buffer has its ``layouts`` recomputed
+    so its output EA also reflects the new input EA.
+
+    Example: a ``for_each_tile`` whose body returns fp32 ``DL16_TO_FP32`` tiles writes
+    them via ``copy_`` into an outer fp32 accumulation buffer.  Without this pass the
+    accumulation buffer stays STANDARD, and a following ``fp32todl16`` conversion reads
+    the physically-staggered data as STANDARD, returning wrong values.
+    """
+    # Collect every mutation writer that lives inside a LoopNode body, keyed by the
+    # name of the buffer they write into.
+    loop_body_writers: dict[str, list["ComputedBuffer"]] = {}
+    for op in _all_loop_ops(operations):
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if not isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        target = op.layout.target
+        while isinstance(target, ReinterpretView):
+            target = target.data
+        name = target.get_name() if hasattr(target, "get_name") else ""
+        if not name:
+            continue
+        loop_body_writers.setdefault(name, []).append(op)
+
+    # For each outer no-op allocation that ended up STANDARD but has loop-body writers
+    # with a staggered EA, upgrade the allocation's layout and recompute any top-level
+    # reader that may have been computed with the old (STANDARD) layout.
+    promoted: set[str] = set()
+    for op in operations:
+        if not op.is_no_op():
+            continue
+        op_layouts = getattr(op, "layouts", None)
+        if not op_layouts:
+            continue
+        current_stl = op_layouts[0]
+        if current_stl.element_arrangement in STAGGERED_EAS:
+            continue  # already staggered, nothing to do
+        writers = loop_body_writers.get(op.get_name(), [])
+        if not writers:
+            continue
+        # A mutation writer's own ``layouts`` is the target's layout (see the
+        # MutationLayoutSHOULDREMOVE branch above), so the arrangement it stores
+        # is that of the value it reads, as in _fresh_allocation_layout.
+        source_eas: set[ElementArrangement] = set()
+        for writer in writers:
+            reads = [
+                r
+                for r in op_read_writes(writer).reads
+                if r.name != op.get_name()
+                and _carries_element_arrangement(r, op.get_dtype())
+            ]
+            for arg in _get_prop_args(reads, strict=False):
+                source_eas.update(s.element_arrangement for s in arg.layouts)
+        staggered_eas = source_eas & STAGGERED_EAS
+        if not staggered_eas:
+            continue
+        if len(staggered_eas) > 1 or (source_eas - staggered_eas):
+            raise Unsupported(
+                f"loop-body writers of {op.get_name()} store mixed element "
+                f"arrangements {sorted(ea.name for ea in source_eas)}"
+            )
+        new_stl = current_stl.with_element_arrangement(next(iter(staggered_eas)))
+        for writer in writers:
+            _check_whole_stagger_units(writer, op.get_layout(), new_stl)
+            # Keep the writers on the buffer's layout, as the mutation branch
+            # assigns them, so they commit the same STL as the target.
+            writer_rw = op_read_writes(writer)
+            writer.layouts = [new_stl]
+            writer.restick_cost_fn = AllSameNode.from_args(
+                _get_prop_args(writer_rw.reads),
+                [new_stl],
+                next(iter(writer_rw.writes)),
+                writer,
+            )
+        op.layouts = [new_stl]
+        promoted.add(op.get_name())
+
+    if not promoted:
+        return
+
+    # Recompute layouts for top-level ComputedBuffers (Pointwise/Reduction) that
+    # directly read a promoted buffer.  Their output EA may have been derived from the
+    # old STANDARD EA via ea_map and must now reflect the new staggered one.
+    for op in operations:
+        if not isinstance(op, ComputedBuffer):
+            continue
+        if isinstance(op.layout, MutationLayoutSHOULDREMOVE):
+            continue
+        op_layouts = getattr(op, "layouts", None)
+        if not op_layouts:
+            continue
+        rw = op_read_writes(op)
+        reads_promoted = any(
+            isinstance(r, MemoryDep) and r.name in promoted for r in rw.reads
+        )
+        if not reads_promoted:
+            continue
+        if not isinstance(op.data, (Pointwise, Reduction)):
+            continue
+        output = op.get_layout()
+        if output is None or output.device.type != DEVICE_NAME:
+            continue
+        output_dep = next(iter(rw.writes))
+        args = _get_prop_args(rw.reads)
+        if not args:
+            continue
+        op.layouts = compute_layouts(op, output, output_dep, args)
 
 
 def _real_layout_matches_op_size(
