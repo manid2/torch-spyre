@@ -67,11 +67,6 @@ _SCATTER_STICK = (
     "compile gather followed by scatter_add produces numerical mismatch vs CPU.",
     r"compiled spyre <-> cpu\S* mismatch\s+Tensor-likes are not (?:close|equal)!",
 )
-_CHUNK_REDUCE_MUTATION = rejection(
-    4754,
-    "compile chunk reduce: no offset-free alternative stick dim for mutation target.",
-    r"no offset-free alternative stick dim for mutation target",
-)
 
 
 class TestGatherComposedChainsAndEndToEndPipelines:
@@ -291,12 +286,6 @@ class TestGatherComposedChainsAndEndToEndPipelines:
     @gap_one_core
     def test_chunk_then_reduce(self, execution_mode):
         """Gather + chunk + per-chunk sum reduction; each quarter summed independently."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/4754
-        _xfail_existing(
-            execution_mode,
-            eager=_CHUNK_REDUCE_MUTATION,
-            compiled=_CHUNK_REDUCE_MUTATION,
-        )
         x = cached_randn((64, 256), differentiation="chnk06", dtype=torch.float16)
         idx = torch.randint(0, 64, (32,), dtype=torch.int64)
         compare_mode(

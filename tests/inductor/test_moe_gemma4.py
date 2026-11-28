@@ -219,11 +219,6 @@ STABLE_SORT = _xfail(
     "#4500: aten::sort.values_stable has no Spyre kernel",
     r"aten::sort\.values_stable",
 )
-TILE_OFFSET_CUMSUM = _xfail(
-    InductorError,
-    "#4754: no offset-free alternative stick dim for mutation target",
-    "no offset-free alternative stick dim for mutation target",
-)
 TOPK_FLOAT_IDS = _xfail(
     AssertionError,
     "#5847: topk returns float32 indices",
@@ -1548,7 +1543,7 @@ def test_G4_E2E_003_decoder_layer_full(execution_mode, T):
 
 
 @pytest.mark.parametrize(
-    "execution_mode", _modes(eager=TILE_OFFSET_CUMSUM, compiled=TILE_OFFSET_CUMSUM)
+    "execution_mode", _modes(eager=REPEAT_INTERLEAVE, compiled=REPEAT_INTERLEAVE)
 )
 def test_G4_AB_003_pad_expert_segments_to_tile32(execution_mode):
     counts = torch.tensor([0, 1, 31, 32, 33, 63, 64] + [0] * 121)

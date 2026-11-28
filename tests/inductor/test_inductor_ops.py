@@ -4842,11 +4842,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     cached_randn((33,), dtype=torch.float16, differentiation="c"),
                 ),
                 # The original #3916 length as a cat: the second piece starts
-                # 384.5 sticks in.
+                # 384.5 sticks in.  Scaled down for the LX-planning reduction
+                # wrap, which sums the whole [24640] fp16 output on device:
+                # at unit variance the chunked fp16 accumulation error (~1.6)
+                # exceeds the wrap's atol floor (1.0).  The error scales with
+                # the values; the layout under test does not.
                 "1d_dim0_unaligned_large_fp16": (
                     0,
-                    cached_randn((24608,), dtype=torch.float16),
-                    cached_randn((32,), dtype=torch.float16),
+                    cached_randn((24608,), dtype=torch.float16, scale=0.1),
+                    cached_randn((32,), dtype=torch.float16, scale=0.1),
                 ),
             },
         },

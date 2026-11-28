@@ -1978,17 +1978,12 @@ class TestCatUnaligned:
         b = cached_randn(
             (33,), dtype=dtype, differentiation=f"cat_1d_unaligned_b_{dtype}"
         )
-        # TODO: Close #3916 and convert to positive test when mutation targets with a non-stick-aligned write offset are supported
-        with pytest.raises(
-            InductorError,
-            match=r"Unsupported: (Spyre backend does not support: )?no offset-free alternative stick dim for mutation target",
-        ):
-            _compare_modes(
-                execution_mode,
-                lambda a, b: _apply_consumer(torch.cat([a, b]), consumer),
-                a,
-                b,
-            )
+        _compare_modes(
+            execution_mode,
+            lambda a, b: _apply_consumer(torch.cat([a, b]), consumer),
+            a,
+            b,
+        )
 
     @pytest.mark.parametrize("consumer", CONSUMERS)
     def test_cat_2d_trailing_unaligned(self, execution_mode, dtype, consumer):
@@ -2693,18 +2688,22 @@ class TestSplitUnaligned:
                 )
             return
         if execution_mode == "compiled" and consumer == "sum_last":
-            # TODO: Close #3916 and convert to positive test when mutation targets with a non-stick-aligned write offset are supported
-            with pytest.raises(
-                InductorError,
-                match=r"Unsupported: (Spyre backend does not support: )?no offset-free alternative stick dim for mutation target",
-            ):
-                _compare_modes(
-                    execution_mode,
-                    lambda t: torch.stack(
-                        [_apply_consumer(c, consumer) for c in t.split(65, dim=-1)]
-                    ),
-                    x,
-                )
+            # Each output element is a 65-element fp16 sum over a mid-stick
+            # slice, which the sparse layout serves one element per stick: the
+            # device accumulates sequentially and errs by a few ulps of the
+            # partial-sum magnitude (~0.03 at unit variance), while the CPU
+            # reference accumulates in fp32 and rounds once.  The file default
+            # (1e-2) is calibrated for pointwise-exact consumers, so fp16 takes
+            # the suite-standard reduction tolerance here; bf16 (2e-2) and fp32
+            # (1e-5) pass with their defaults.
+            _compare_modes(
+                execution_mode,
+                lambda t: torch.stack(
+                    [_apply_consumer(c, consumer) for c in t.split(65, dim=-1)]
+                ),
+                x,
+                atol=0.1 if dtype == torch.float16 else None,
+            )
             return
         if execution_mode == "compiled" and consumer == "pointwise":
             # TODO: Convert to positive test when unaligned split offsets are supported (#5216)
